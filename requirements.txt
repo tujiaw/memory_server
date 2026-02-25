@@ -13,9 +13,8 @@ mem0ai==0.1.75
 # OpenAI
 openai==1.55.0
 
-# MongoDB
+# MongoDB (motor includes pymongo)
 motor==3.6.0
-pymongo==4.10.1
 
 # Authentication & Security
 python-jose[cryptography]==3.3.0
