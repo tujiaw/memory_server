@@ -1,0 +1,27 @@
+# FastAPI and server
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+pydantic-settings==2.6.0
+
+# Qdrant (required by mem0)
+qdrant-client==1.12.1
+
+# Mem0 - Memory management
+mem0ai==0.1.75
+
+# OpenAI
+openai==1.55.0
+
+# MongoDB
+motor==3.6.0
+pymongo==4.10.1
+
+# Authentication & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.12
+
+# Utilities
+python-dotenv==1.0.1
+orjson==3.10.12
