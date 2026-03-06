@@ -1,346 +1,216 @@
 # Memory Server
 
-A user memory management API powered by **mem0** + **Qdrant** + **OpenAI** + **MongoDB**. Intelligently store, search, and manage user memories with semantic understanding.
+面向公司内部团队的 Memory 平台 API。项目集成开源 `mem0`，通过 `FastAPI` 提供稳定、易用的服务到服务接口，帮助 AI 项目高效接入长期 memory，同时保留对效果的基本控制能力。
 
-## Features
+## 当前能力
 
-- **User Profile Management** (MongoDB): Persistent user data, preferences, and statistics
-- **Semantic Memory Storage** (Qdrant + mem0): Store facts with automatic embedding
-- **Smart Search**: Find relevant memories using semantic similarity
-- **Conversation Memory Extraction**: Automatically extract important information from conversations
-- **Batch Operations**: Add multiple memories at once
-- **Multi-User Support**: Each user gets isolated memory storage
+- 服务到服务鉴权：内部服务使用 `client_id/client_secret` 换取 JWT
+- `namespace + subject_id` 隔离：不同团队和业务主体分离存储
+- 单条写入、批量写入、会话抽取、语义检索
+- Subject Context：把主体画像存入 MongoDB，用于增强 memory 写入效果
+- 健康检查：真实探测 MongoDB、Qdrant 和 OpenAI 配置状态
 
-## Architecture
+## 技术栈
 
-```
-memory_server/
-├── app/
-│   ├── api/
-│   │   ├── mem0_routes.py      # Memory API endpoints
-│   │   └── user_routes.py       # User API endpoints
-│   ├── core/
-│   │   └── config.py            # Configuration management
-│   ├── database/
-│   │   └── mongodb.py           # MongoDB connection
-│   ├── models/
-│   │   └── schemas.py           # Pydantic schemas
-│   └── services/
-│       ├── mem0_service.py      # mem0 business logic
-│       └── user_service.py      # User management logic
-├── main.py                       # Application entry point
-├── docker-compose.yml            # Qdrant + MongoDB + API
-└── requirements.txt              # Dependencies
-```
+- API: `FastAPI`
+- Memory: `mem0`
+- Vector Store: `Qdrant`
+- Context Storage: `MongoDB`
+- LLM/Embedding: `OpenAI`
 
-## Data Storage
+## 快速启动
 
-| Component | Purpose | Storage |
-|-----------|---------|---------|
-| **MongoDB** | User profiles, preferences, stats | `users` collection |
-| **Qdrant** | Semantic memory vectors | `mem0_{user_id}` collections |
-
-## Quick Start
-
-### Using Docker Compose (Recommended)
+### 方式一：本地脚本
 
 ```bash
-# 1. Copy environment variables
 cp .env.example .env
-
-# 2. Edit .env with your settings
-# Set OPENAI_API_KEY and OPENAI_API_BASE
-
-# 3. Start all services (Qdrant + MongoDB + API)
-docker-compose up -d
-
-# 4. Access API
-# API: http://localhost:8000
-# Docs: http://localhost:8000/docs
+# 编辑 .env，至少填写 OPENAI_API_KEY、SECRET_KEY、SERVICE_CLIENTS_JSON
+./start.sh
 ```
 
-### Local Development
+### 方式二：Docker Compose
 
 ```bash
-# 1. Install dependencies
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# 2. Start Qdrant and MongoDB
-docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
-docker run -p 27017:27017 mongo:8.0
-
-# 3. Configure environment
 cp .env.example .env
-# Edit .env with your settings
-
-# 4. Run the API
-python main.py
+docker compose up --build
 ```
 
-## API Endpoints
+服务默认地址：
 
-### User Management
+- API: `http://localhost:8899`
+- Docs: `http://localhost:8899/docs`
+- Health: `http://localhost:8899/health`
 
-#### Create User
-```http
-POST /api/v1/users
-Content-Type: application/json
+## 必填配置
 
+`.env` 至少需要配置：
+
+- `OPENAI_API_KEY`
+- `OPENAI_API_BASE`
+- `SECRET_KEY`
+- `SERVICE_CLIENTS_JSON`
+
+`SERVICE_CLIENTS_JSON` 示例：
+
+```json
 {
-  "user_id": "user123",
-  "name": "Alice Chen",
-  "email": "alice@example.com",
-  "role": "software engineer",
-  "preferences": {
-    "language": "Python",
-    "timezone": "UTC-8"
+  "svc-agent": {
+    "secret": "replace-me",
+    "scopes": ["memory:read", "memory:write", "context:read", "context:write"],
+    "namespaces": ["team-a"]
   }
 }
 ```
 
-#### Get User
-```http
-GET /api/v1/users/user123
-```
+## 鉴权流程
 
-#### Update User
+先换取访问令牌：
+
 ```http
-PUT /api/v1/users/user123
+POST /api/v1/auth/token
 Content-Type: application/json
 
 {
-  "name": "Alice Chen",
-  "preferences": {
-    "language": "Python",
-    "timezone": "UTC-8",
-    "theme": "dark"
-  }
+  "client_id": "svc-agent",
+  "client_secret": "replace-me"
 }
 ```
 
-#### List Users
+成功后在后续请求中带上：
+
 ```http
-GET /api/v1/users?limit=50
+Authorization: Bearer <access_token>
 ```
 
-#### Delete User
-```http
-DELETE /api/v1/users/user123
-```
+## 核心接口
 
-#### User Statistics
-```http
-GET /api/v1/users/user123/stats
-```
+### 1. 写入单条 Memory
 
-### Memory Operations
-
-#### Add Memory
 ```http
 POST /api/v1/memories
+Authorization: Bearer <token>
 Content-Type: application/json
 
 {
-  "user_id": "user123",
-  "content": "I prefer working with Python over JavaScript",
-  "metadata": {"category": "preference"}
-}
-```
-
-**Note**: User info is automatically fetched from MongoDB for personalized memory extraction.
-
-#### Search Memories
-```http
-POST /api/v1/memories/search
-Content-Type: application/json
-
-{
-  "user_id": "user123",
-  "query": "What programming languages do I like?",
-  "limit": 5
-}
-```
-
-#### Get All Memories
-```http
-GET /api/v1/memories/user123?limit=50
-```
-
-#### Update Memory
-```http
-PUT /api/v1/memories
-Content-Type: application/json
-
-{
-  "user_id": "user123",
-  "memory_id": "abc123",
-  "content": "I prefer Python and TypeScript"
-}
-```
-
-#### Delete Memory
-```http
-DELETE /api/v1/memories
-Content-Type: application/json
-
-{
-  "user_id": "user123",
-  "memory_id": "abc123"
-}
-```
-
-### Batch Operations
-
-#### Add Multiple Memories
-```http
-POST /api/v1/memories/batch
-Content-Type: application/json
-
-{
-  "user_id": "user123",
-  "memories": [
-    "I love coffee in the morning",
-    "I work best in the afternoon",
-    "I prefer asynchronous communication"
-  ]
-}
-```
-
-### Conversation Memory
-
-#### Extract Memories from Conversation
-```http
-POST /api/v1/memories/conversation
-Content-Type: application/json
-
-{
-  "user_id": "user123",
-  "messages": [
-    {"role": "user", "content": "My name is Alice"},
-    {"role": "assistant", "content": "Hello Alice!"},
-    {"role": "user", "content": "I'm a software engineer"}
-  ]
-}
-```
-
-### User Context (Memory-aware)
-
-#### Set User Context
-```http
-POST /api/v1/memories/context
-Content-Type: application/json
-
-{
-  "user_id": "user123",
-  "name": "Alice Chen",
-  "email": "alice@example.com",
-  "role": "software engineer",
-  "preferences": {
-    "language": "Python",
-    "timezone": "UTC-8"
+  "namespace": "team-a",
+  "subject_id": "user-123",
+  "run_id": "session-001",
+  "content": "The user prefers Python for backend work.",
+  "metadata": {
+    "category": "preference"
   }
 }
 ```
 
-**Note**: This updates both MongoDB (persistent) and adds a context memory for mem0.
+### 2. 搜索 Memory
 
-#### Get User Context
 ```http
-GET /api/v1/memories/context/user123
-```
+POST /api/v1/memories/search
+Authorization: Bearer <token>
+Content-Type: application/json
 
-## Configuration
-
-Environment variables (`.env`):
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `OPENAI_API_KEY` | OpenAI API key | **Required** |
-| `OPENAI_API_BASE` | OpenAI API base URL | **Required** |
-| `OPENAI_MODEL` | LLM model | `gpt-4o-mini` |
-| `OPENAI_EMBEDDING_MODEL` | Embedding model | `text-embedding-3-small` |
-| `QDRANT_HOST` | Qdrant host | `localhost` |
-| `QDRANT_PORT` | Qdrant port | `6333` |
-| `MONGO_URI` | MongoDB URI | `mongodb://localhost:27017` |
-| `MONGO_DB` | MongoDB database | `memory_server` |
-| `VECTOR_SIZE` | Embedding dimensions | `1536` |
-
-## How It Works
-
-### User Data Flow
-
-1. **User Creation**: Stored in MongoDB with profile, preferences, stats
-2. **Memory Addition**: User info fetched from MongoDB → sent to mem0 for personalized extraction
-3. **Auto-updates**: Memory count and last_active automatically updated in MongoDB
-
-### Memory Storage
-
-- Each user gets isolated Qdrant collection (`mem0_{user_id}`)
-- Content embedded using OpenAI's `text-embedding-3-small`
-- mem0 intelligently extracts facts using user context from MongoDB
-
-### Example Flow
-
-```python
-# 1. Create user (stored in MongoDB)
-POST /api/v1/users {"user_id": "alice", "name": "Alice"}
-
-# 2. Add memory (user info auto-fetched from MongoDB)
-POST /api/v1/memories {
-  "user_id": "alice",
-  "content": "I love Python"
+{
+  "namespace": "team-a",
+  "subject_id": "user-123",
+  "run_id": "session-001",
+  "query": "What backend language does the user prefer?",
+  "limit": 5,
+  "filters": {
+    "category": "preference"
+  }
 }
-
-# 3. Memory count auto-incremented in MongoDB
-GET /api/v1/users/alice/stats
-# Returns: {"memory_count": 1, "last_active": "..."}
 ```
 
-## Example Usage
+### 3. 批量写入
 
-### Python Client
+```http
+POST /api/v1/memories/batch
+Authorization: Bearer <token>
+Content-Type: application/json
 
-```python
-import requests
-
-BASE_URL = "http://localhost:8000/api/v1"
-
-# Create user
-requests.post(f"{BASE_URL}/users", json={
-    "user_id": "alice",
-    "name": "Alice Chen",
-    "email": "alice@example.com"
-})
-
-# Add memory (user info auto-loaded from MongoDB)
-requests.post(f"{BASE_URL}/memories", json={
-    "user_id": "alice",
-    "content": "I prefer Python over JavaScript"
-})
-
-# Search memories
-response = requests.post(f"{BASE_URL}/memories/search", json={
-    "user_id": "alice",
-    "query": "programming preferences"
-})
-print(response.json())
-
-# Get user stats
-response = requests.get(f"{BASE_URL}/users/alice/stats")
-print(response.json())
+{
+  "namespace": "team-a",
+  "subject_id": "user-123",
+  "memories": [
+    { "content": "Works best in the morning." },
+    { "content": "Prefers concise answers.", "metadata": { "category": "style" } }
+  ]
+}
 ```
 
-## Production Considerations
+### 4. 从会话中抽取 Memory
 
-- Set `DEBUG=False` in production
-- Use managed Qdrant and MongoDB instances for scalability
-- Implement proper authentication/authorization
-- Configure CORS appropriately for your domain
-- Set up monitoring and logging
-- Use a secrets manager for API keys
+```http
+POST /api/v1/memories/conversation
+Authorization: Bearer <token>
+Content-Type: application/json
 
-## License
+{
+  "namespace": "team-a",
+  "subject_id": "user-123",
+  "run_id": "chat-42",
+  "messages": [
+    { "role": "user", "content": "I usually write Python services." },
+    { "role": "assistant", "content": "Got it." }
+  ]
+}
+```
 
-MIT
+### 5. 写入 Subject Context
+
+```http
+PUT /api/v1/subjects/user-123/context
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "namespace": "team-a",
+  "name": "Alice",
+  "role": "software engineer",
+  "preferences": {
+    "language": "Python",
+    "response_style": "concise"
+  }
+}
+```
+
+## 返回与错误
+
+成功响应统一为：
+
+```json
+{
+  "success": true,
+  "message": "optional",
+  "data": {}
+}
+```
+
+失败响应统一为：
+
+```json
+{
+  "success": false,
+  "code": "HTTP_403",
+  "message": "Missing required scope: memory:write"
+}
+```
+
+## 项目结构
+
+```text
+app/
+  api/         # 路由层
+  core/        # 配置与依赖注入
+  database/    # MongoDB 连接
+  models/      # Pydantic schemas
+  services/    # auth / mem0 / subject context 业务逻辑
+main.py        # 应用入口与全局错误/健康检查
+tests/         # 最小回归测试
+```
+
+## 开发验证
+
+```bash
+./venv/bin/python -m pytest tests -q
+```

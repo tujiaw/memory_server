@@ -32,5 +32,16 @@ mongodb = MongoDB()
 
 
 async def get_user_collection():
-    """Get the users collection."""
+    """Backward-compatible alias for the subjects collection."""
     return mongodb.get_collection(settings.MONGO_COLLECTION_USERS)
+
+
+async def get_subject_collection():
+    """Get the subject context collection."""
+    collection_name = getattr(settings, "MONGO_COLLECTION_SUBJECTS", settings.MONGO_COLLECTION_USERS)
+    return mongodb.get_collection(collection_name)
+
+
+async def get_service_client_collection():
+    """Get the service client collection."""
+    return mongodb.get_collection(settings.MONGO_COLLECTION_SERVICE_CLIENTS)

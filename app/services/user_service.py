@@ -1,70 +1,34 @@
-from typing import Optional, Dict, Any, List
-from datetime import datetime
-from bson import ObjectId
-from app.database.mongodb import get_user_collection
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+from app.database.mongodb import get_subject_collection
 
 
 class UserService:
-    """Service for managing user profiles in MongoDB."""
+    """Service for managing subject context in MongoDB."""
 
-    async def create_user(
+    @staticmethod
+    def _subject_key(namespace: str, subject_id: str) -> str:
+        return f"{namespace}:{subject_id}"
+
+    async def upsert_subject_context(
         self,
-        user_id: str,
+        namespace: str,
+        subject_id: str,
         name: Optional[str] = None,
         email: Optional[str] = None,
         role: Optional[str] = None,
         preferences: Optional[Dict[str, Any]] = None,
         custom_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Create a new user.
+        collection = await get_subject_collection()
+        now = datetime.now(timezone.utc)
 
-        Returns the created user document.
-        """
-        collection = await get_user_collection()
-
-        user_doc = {
-            "_id": user_id,
-            "name": name,
-            "email": email,
-            "role": role,
-            "preferences": preferences or {},
-            "custom_data": custom_data or {},
-            "created_at": datetime.now(),
-            "updated_at": datetime.now(),
-            "last_active": datetime.now(),
-            "memory_count": 0,
+        update_data = {
+            "namespace": namespace,
+            "subject_id": subject_id,
+            "updated_at": now,
         }
-
-        await collection.insert_one(user_doc)
-
-        return self._serialize_user(user_doc)
-
-    async def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Get a user by ID."""
-        collection = await get_user_collection()
-
-        user_doc = await collection.find_one({"_id": user_id})
-
-        if user_doc:
-            return self._serialize_user(user_doc)
-
-        return None
-
-    async def update_user(
-        self,
-        user_id: str,
-        name: Optional[str] = None,
-        email: Optional[str] = None,
-        role: Optional[str] = None,
-        preferences: Optional[Dict[str, Any]] = None,
-        custom_data: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Update user information."""
-        collection = await get_user_collection()
-
-        update_data = {"updated_at": datetime.now()}
-
         if name is not None:
             update_data["name"] = name
         if email is not None:
@@ -76,84 +40,102 @@ class UserService:
         if custom_data is not None:
             update_data["custom_data"] = custom_data
 
-        result = await collection.update_one(
-            {"_id": user_id},
-            {"$set": update_data}
-        )
-
-        if result.modified_count > 0:
-            return await self.get_user(user_id)
-
-        return None
-
-    async def delete_user(self, user_id: str) -> bool:
-        """Delete a user."""
-        collection = await get_user_collection()
-
-        result = await collection.delete_one({"_id": user_id})
-
-        return result.deleted_count > 0
-
-    async def update_last_active(self, user_id: str) -> None:
-        """Update user's last active timestamp."""
-        collection = await get_user_collection()
-
         await collection.update_one(
-            {"_id": user_id},
-            {"$set": {"last_active": datetime.now()}}
+            {"_id": self._subject_key(namespace, subject_id)},
+            {
+                "$set": update_data,
+                "$setOnInsert": {
+                    "created_at": now,
+                    "last_active": now,
+                    "memory_count": 0,
+                },
+            },
+            upsert=True,
         )
 
-    async def increment_memory_count(self, user_id: str) -> None:
-        """Increment user's memory count."""
-        collection = await get_user_collection()
+        return await self.get_subject_context(namespace, subject_id)
 
+    async def get_subject_context(self, namespace: str, subject_id: str) -> Optional[Dict[str, Any]]:
+        collection = await get_subject_collection()
+        document = await collection.find_one({"_id": self._subject_key(namespace, subject_id)})
+
+        if document is None:
+            return None
+
+        return self._serialize_subject(document)
+
+    async def touch_subject(self, namespace: str, subject_id: str) -> None:
+        collection = await get_subject_collection()
         await collection.update_one(
-            {"_id": user_id},
-            {"$inc": {"memory_count": 1}}
+            {"_id": self._subject_key(namespace, subject_id)},
+            {
+                "$set": {
+                    "namespace": namespace,
+                    "subject_id": subject_id,
+                    "last_active": datetime.now(timezone.utc),
+                },
+                "$setOnInsert": {
+                    "created_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc),
+                    "memory_count": 0,
+                    "preferences": {},
+                    "custom_data": {},
+                },
+            },
+            upsert=True,
         )
 
-    async def get_user_stats(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Get user statistics."""
-        user = await self.get_user(user_id)
+    async def increment_memory_count(self, namespace: str, subject_id: str, amount: int = 1) -> None:
+        collection = await get_subject_collection()
+        now = datetime.now(timezone.utc)
+        await collection.update_one(
+            {"_id": self._subject_key(namespace, subject_id)},
+            {
+                "$set": {
+                    "namespace": namespace,
+                    "subject_id": subject_id,
+                    "last_active": now,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "created_at": now,
+                    "preferences": {},
+                    "custom_data": {},
+                },
+                "$inc": {"memory_count": amount},
+            },
+            upsert=True,
+        )
 
-        if user:
-            return {
-                "user_id": user["id"],
-                "name": user.get("name"),
-                "email": user.get("email"),
-                "memory_count": user.get("memory_count", 0),
-                "created_at": user.get("created_at"),
-                "last_active": user.get("last_active"),
-            }
+    async def get_subject_stats(self, namespace: str, subject_id: str) -> Optional[Dict[str, Any]]:
+        context = await self.get_subject_context(namespace, subject_id)
+        if context is None:
+            return None
 
-        return None
-
-    async def list_users(
-        self,
-        limit: int = 100,
-        skip: int = 0,
-    ) -> List[Dict[str, Any]]:
-        """List all users with pagination."""
-        collection = await get_user_collection()
-
-        cursor = collection.find().skip(skip).limit(limit)
-        users = await cursor.to_list(length=limit)
-
-        return [self._serialize_user(user) for user in users]
-
-    def _serialize_user(self, user_doc: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert MongoDB document to API response format."""
         return {
-            "id": user_doc["_id"],
-            "name": user_doc.get("name"),
-            "email": user_doc.get("email"),
-            "role": user_doc.get("role"),
-            "preferences": user_doc.get("preferences", {}),
-            "custom_data": user_doc.get("custom_data", {}),
-            "created_at": user_doc.get("created_at"),
-            "updated_at": user_doc.get("updated_at"),
-            "last_active": user_doc.get("last_active"),
-            "memory_count": user_doc.get("memory_count", 0),
+            "namespace": namespace,
+            "subject_id": subject_id,
+            "name": context.get("name"),
+            "email": context.get("email"),
+            "memory_count": context.get("memory_count", 0),
+            "created_at": context.get("created_at"),
+            "last_active": context.get("last_active"),
+        }
+
+    @staticmethod
+    def _serialize_subject(document: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "namespace": document["namespace"],
+            "subject_id": document["subject_id"],
+            "name": document.get("name"),
+            "email": document.get("email"),
+            "role": document.get("role"),
+            "preferences": document.get("preferences", {}),
+            "custom_data": document.get("custom_data", {}),
+            "created_at": document.get("created_at").isoformat() if document.get("created_at") else None,
+            "updated_at": document.get("updated_at").isoformat() if document.get("updated_at") else None,
+            "last_active": document.get("last_active").isoformat() if document.get("last_active") else None,
+            "memory_count": document.get("memory_count", 0),
         }
 
 

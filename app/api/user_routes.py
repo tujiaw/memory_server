@@ -1,154 +1,78 @@
-from fastapi import APIRouter, HTTPException, status
-from typing import Optional, List
+from typing import Annotated
 
-from app.models.schemas import (
-    UserContext,
-    MemoryResponse,
-)
-from app.services.user_service import user_service
+from fastapi import APIRouter, Depends, HTTPException, status
 
-router = APIRouter(prefix="/users", tags=["Users"])
+from app.core.deps import authorize_namespace, get_auth_context
+from app.models.schemas import AuthContext, MemoryResponse, SubjectContextInput
+from app.services.mem0_service import mem0_service
+
+router = APIRouter(prefix="/subjects", tags=["Subjects"])
 
 
-# ============================================================================
-# User Management
-# ============================================================================
-
-@router.post("", response_model=MemoryResponse, status_code=status.HTTP_201_CREATED)
-async def create_user(request: UserContext):
-    """
-    Create a new user.
-
-    User information is stored in MongoDB for persistent profile management.
-    """
+@router.put("/{subject_id}/context", response_model=MemoryResponse)
+async def set_subject_context(
+    subject_id: str,
+    request: SubjectContextInput,
+    auth_context: Annotated[AuthContext, Depends(get_auth_context)],
+):
+    """Upsert subject context used to improve memory quality."""
     try:
-        user = await user_service.create_user(
-            user_id=request.user_id,
-            name=request.name,
-            email=request.email,
-            role=request.role,
-            preferences=request.preferences,
-            custom_data=request.custom_data,
+        authorize_namespace(auth_context, request.namespace, "context:write")
+        context = await mem0_service.set_subject_context(
+            namespace=request.namespace,
+            subject_id=subject_id,
+            context=request.model_dump(exclude={"namespace"}),
         )
-        return MemoryResponse(success=True, message="User created successfully", data=user)
-    except Exception as e:
-        if "duplicate key" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"User with ID '{request.user_id}' already exists",
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create user: {str(e)}",
-        )
-
-
-@router.get("/{user_id}", response_model=MemoryResponse)
-async def get_user(user_id: str):
-    """Get user information by ID."""
-    try:
-        user = await user_service.get_user(user_id)
-
-        if user is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"User '{user_id}' not found",
-            )
-
-        return MemoryResponse(success=True, data=user)
+        return MemoryResponse(success=True, message="Subject context updated", data=context)
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get user: {str(e)}",
+            detail=f"Failed to set subject context: {str(exc)}",
         )
 
 
-@router.put("/{user_id}", response_model=MemoryResponse)
-async def update_user(user_id: str, request: UserContext):
-    """Update user information."""
+@router.get("/{subject_id}/context", response_model=MemoryResponse)
+async def get_subject_context(
+    subject_id: str,
+    namespace: str,
+    auth_context: Annotated[AuthContext, Depends(get_auth_context)],
+):
+    """Read subject context by namespace and subject ID."""
     try:
-        user = await user_service.update_user(
-            user_id=user_id,
-            name=request.name,
-            email=request.email,
-            role=request.role,
-            preferences=request.preferences,
-            custom_data=request.custom_data,
-        )
-
-        if user is None:
+        authorize_namespace(auth_context, namespace, "context:read")
+        context = await mem0_service.get_subject_context(namespace=namespace, subject_id=subject_id)
+        if not context:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"User '{user_id}' not found",
+                detail=f"Subject '{subject_id}' not found in namespace '{namespace}'",
             )
-
-        return MemoryResponse(success=True, message="User updated successfully", data=user)
+        return MemoryResponse(success=True, data=context)
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update user: {str(e)}",
+            detail=f"Failed to get subject context: {str(exc)}",
         )
 
 
-@router.delete("/{user_id}", response_model=MemoryResponse)
-async def delete_user(user_id: str):
-    """Delete a user."""
+@router.get("/{subject_id}/stats", response_model=MemoryResponse)
+async def get_subject_stats(
+    subject_id: str,
+    namespace: str,
+    auth_context: Annotated[AuthContext, Depends(get_auth_context)],
+):
+    """Get memory statistics for a subject."""
     try:
-        success = await user_service.delete_user(user_id)
-
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"User '{user_id}' not found",
-            )
-
-        return MemoryResponse(success=True, message="User deleted successfully")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete user: {str(e)}",
-        )
-
-
-@router.get("", response_model=MemoryResponse)
-async def list_users(limit: int = 100, skip: int = 0):
-    """List all users with pagination."""
-    try:
-        users = await user_service.list_users(limit=limit, skip=skip)
-        return MemoryResponse(
-            success=True,
-            data={"users": users, "count": len(users)}
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list users: {str(e)}",
-        )
-
-
-@router.get("/{user_id}/stats", response_model=MemoryResponse)
-async def get_user_stats(user_id: str):
-    """Get user statistics."""
-    try:
-        stats = await user_service.get_user_stats(user_id)
-
-        if stats is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"User '{user_id}' not found",
-            )
-
+        authorize_namespace(auth_context, namespace, "context:read")
+        stats = await mem0_service.get_subject_stats(namespace=namespace, subject_id=subject_id)
         return MemoryResponse(success=True, data=stats)
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get user stats: {str(e)}",
+            detail=f"Failed to get subject stats: {str(exc)}",
         )

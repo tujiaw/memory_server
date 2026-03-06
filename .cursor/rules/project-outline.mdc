@@ -1,0 +1,46 @@
+---
+description: Memory Server 项目大纲与模块定位
+alwaysApply: true
+---
+
+# Memory Server 项目大纲
+
+这是一个基于 `FastAPI` 的后端 API 服务，核心能力是 `JWT 鉴权 + MongoDB 用户资料 + mem0/Qdrant 语义记忆管理`。
+
+## 项目目标
+
+- 该项目的核心目标是集成开源 `mem0`，对外提供稳定、易用、适合内部复用的 memory API。
+- 主要服务对象是公司内其他团队的开发人员，帮助他们在各类 AI 项目中更高效地接入和使用 memory 能力。
+- 设计和改动时同时关注两个方向：一是接口足够简单直接，二是 memory 效果和使用体验不能因为封装而下降。
+
+## 入口与运行
+
+- `main.py` 是应用入口，负责创建 `FastAPI` 应用、注册路由、配置 CORS，并在生命周期里连接/断开 `MongoDB`。
+- `start.sh` 是本地启动脚本，会准备 `.env`、启动 `Qdrant` 与 `MongoDB`、安装依赖并启动服务。
+- `requirements.txt` 体现核心技术栈：`FastAPI`、`mem0`、`Qdrant`、`MongoDB`、`OpenAI`、`JWT`。
+
+## 目录职责
+
+- `app/api/`：HTTP 路由层，负责参数接收、响应格式和状态码映射，不承载核心业务。
+- `app/services/`：业务逻辑层，处理认证、用户、记忆等核心流程。
+- `app/core/`：全局配置与依赖注入，包含环境变量配置和当前用户认证依赖。
+- `app/database/`：数据库连接与集合访问封装。
+- `app/models/`：Pydantic 请求/响应模型，主要用于接口 schema，而不是 ORM 实体。
+
+## 业务主线
+
+- 认证链路：`app/api/auth_routes.py`、`app/services/auth_service.py`、`app/core/deps.py`
+- 用户链路：`app/api/user_routes.py`、`app/services/user_service.py`
+- 记忆链路：`app/api/mem0_routes.py`、`app/services/mem0_service.py`
+
+## 修改代码时的定位方式
+
+- 调整接口行为时，优先沿着 `route -> service -> database/config` 的路径追踪。
+- 涉及鉴权或 token 时，先看认证链路，而不是直接在业务路由里加判断。
+- 涉及用户资料持久化时，优先查看 `user_service` 与 `MongoDB` 封装。
+- 涉及语义记忆、检索、批量写入、会话抽取时，优先查看 `mem0_service`。
+
+## 示例
+
+- 例：要修改 JWT 认证行为，先检查 `app/services/auth_service.py` 的 token 生成/校验，再看 `app/core/deps.py` 如何把 token 解析为当前用户。
+- 例：要修改“创建用户”接口，先看 `app/api/user_routes.py` 的请求/响应，再看 `app/services/user_service.py` 的持久化逻辑。
