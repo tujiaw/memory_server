@@ -21,7 +21,7 @@ async def get_auth_context(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    auth_context = auth_service.verify_token(credentials.credentials)
+    auth_context = await auth_service.verify_token(credentials.credentials)
 
     if auth_context is None:
         raise HTTPException(
@@ -58,14 +58,8 @@ async def require_admin_token(
         )
 
 
-def authorize_namespace(auth_context: AuthContext, namespace: str, required_scope: str) -> None:
+def authorize_namespace(auth_context: AuthContext, namespace: str) -> None:
     """校验当前服务是否具备指定 namespace 的访问权限。"""
-    if required_scope not in auth_context.scopes:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Missing required scope: {required_scope}",
-        )
-
     if "*" in auth_context.namespaces:
         return
 
@@ -74,20 +68,6 @@ def authorize_namespace(auth_context: AuthContext, namespace: str, required_scop
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Service '{auth_context.service_id}' cannot access namespace '{namespace}'",
         )
-
-
-def require_scope(required_scope: str):
-    async def dependency(
-        auth_context: Annotated[AuthContext, Depends(get_auth_context)],
-    ) -> AuthContext:
-        if required_scope not in auth_context.scopes:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Missing required scope: {required_scope}",
-            )
-        return auth_context
-
-    return dependency
 
 
 # 可选的认证（允许匿名访问）

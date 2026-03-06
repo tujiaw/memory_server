@@ -17,7 +17,7 @@ async def set_subject_context(
 ):
     """Upsert subject context used to improve memory quality."""
     try:
-        authorize_namespace(auth_context, request.namespace, "context:write")
+        authorize_namespace(auth_context, request.namespace)
         context = await mem0_service.set_subject_context(
             namespace=request.namespace,
             subject_id=subject_id,
@@ -41,7 +41,7 @@ async def get_subject_context(
 ):
     """Read subject context by namespace and subject ID."""
     try:
-        authorize_namespace(auth_context, namespace, "context:read")
+        authorize_namespace(auth_context, namespace)
         context = await mem0_service.get_subject_context(namespace=namespace, subject_id=subject_id)
         if not context:
             raise HTTPException(
@@ -66,7 +66,7 @@ async def get_subject_stats(
 ):
     """Get memory statistics for a subject."""
     try:
-        authorize_namespace(auth_context, namespace, "context:read")
+        authorize_namespace(auth_context, namespace)
         stats = await mem0_service.get_subject_stats(namespace=namespace, subject_id=subject_id)
         return MemoryResponse(success=True, data=stats)
     except HTTPException:

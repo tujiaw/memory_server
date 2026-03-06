@@ -11,10 +11,11 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key")
 os.environ.setdefault("ADMIN_API_TOKEN", "test-admin-token")
 os.environ.setdefault(
     "SERVICE_CLIENTS_JSON",
-    '{"svc-agent":{"secret":"top-secret","scopes":["memory:read","memory:write","context:read","context:write"],"namespaces":["team-a"]}}',
+    '{"svc-agent":{"secret":"top-secret","namespaces":["team-a"]}}',
 )
 
 import main
+from app.core.config import settings
 
 
 class FakeCursor:
@@ -89,6 +90,7 @@ def admin_client(monkeypatch):
     monkeypatch.setattr(main.mongodb, "connect", fake_connect)
     monkeypatch.setattr(main.mongodb, "disconnect", fake_disconnect)
     monkeypatch.setattr(main.mongodb, "get_collection", lambda _: fake_collection)
+    monkeypatch.setattr(settings, "ADMIN_API_TOKEN", "test-admin-token")
 
     return TestClient(main.app)
 
@@ -99,7 +101,6 @@ def test_admin_client_lifecycle(admin_client):
         headers={"X-Admin-Token": "test-admin-token"},
         json={
             "client_id": "svc-analytics",
-            "scopes": ["memory:read"],
             "namespaces": ["team-b"],
             "description": "analytics client",
         },
@@ -125,12 +126,11 @@ def test_admin_client_lifecycle(admin_client):
     update_response = admin_client.patch(
         "/api/v1/admin/clients/svc-analytics",
         headers={"X-Admin-Token": "test-admin-token"},
-        json={"scopes": ["memory:read", "memory:write"], "description": "updated analytics"},
+        json={"description": "updated analytics"},
     )
 
     assert update_response.status_code == 200
     update_payload = update_response.json()
-    assert update_payload["scopes"] == ["memory:read", "memory:write"]
     assert update_payload["description"] == "updated analytics"
 
     delete_response = admin_client.delete(
@@ -147,7 +147,6 @@ def test_reset_client_secret_returns_new_secret_and_invalidates_old(admin_client
         headers={"X-Admin-Token": "test-admin-token"},
         json={
             "client_id": "svc-reset",
-            "scopes": ["memory:read"],
             "namespaces": ["team-x"],
         },
     )
@@ -181,7 +180,6 @@ def test_issue_token_prefers_mongodb_client_over_env_fallback(admin_client):
         headers={"X-Admin-Token": "test-admin-token"},
         json={
             "client_id": "svc-agent",
-            "scopes": ["memory:read"],
             "namespaces": ["team-b"],
             "description": "mongodb override",
         },
@@ -198,5 +196,4 @@ def test_issue_token_prefers_mongodb_client_over_env_fallback(admin_client):
     assert token_response.status_code == 200
     payload = token_response.json()
     assert payload["service_id"] == "svc-agent"
-    assert payload["scopes"] == ["memory:read"]
     assert payload["namespaces"] == ["team-b"]

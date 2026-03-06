@@ -45,3 +45,8 @@ async def get_subject_collection():
 async def get_service_client_collection():
     """Get the service client collection."""
     return mongodb.get_collection(settings.MONGO_COLLECTION_SERVICE_CLIENTS)
+
+
+async def get_service_token_collection():
+    """Get the issued service token collection."""
+    return mongodb.get_collection(settings.MONGO_COLLECTION_SERVICE_TOKENS)

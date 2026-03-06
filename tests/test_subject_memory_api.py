@@ -10,7 +10,7 @@ os.environ.setdefault("OPENAI_API_BASE", "https://example.com/v1")
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
 os.environ.setdefault(
     "SERVICE_CLIENTS_JSON",
-    '{"svc-agent":{"secret":"top-secret","scopes":["memory:read","memory:write","context:read","context:write"],"namespaces":["team-a"]}}',
+    '{"svc-agent":{"secret":"top-secret","namespaces":["team-a"]}}',
 )
 
 from app.api.mem0_routes import router as memory_router
@@ -27,10 +27,9 @@ def build_app() -> TestClient:
     return TestClient(app)
 
 
-def auth_headers(scopes=None, namespaces=None):
+def auth_headers(namespaces=None):
     token = auth_service.create_service_token(
         service_id="svc-agent",
-        scopes=scopes or ["memory:read", "memory:write", "context:read", "context:write"],
         namespaces=namespaces or ["team-a"],
     )
     return {"Authorization": f"Bearer {token}"}
@@ -64,6 +63,40 @@ def test_add_memory_uses_subject_scope(monkeypatch):
     assert captured["run_id"] == "session-1"
 
 
+def test_memory_context_returns_llm_ready_string(monkeypatch):
+    async def fake_get_context_for_llm(**kwargs):
+        return {
+            "context": "以下是关于该用户的关键记忆：\n\n1. 用户喜欢 Python\n2. 用户在上海工作",
+            "count": 2,
+            "sources": [
+                {"id": "m1", "text": "用户喜欢 Python", "score": 0.9},
+                {"id": "m2", "text": "用户在上海工作", "score": 0.85},
+            ],
+        }
+
+    monkeypatch.setattr(mem0_service, "get_context_for_llm", fake_get_context_for_llm)
+
+    client = build_app()
+    response = client.post(
+        "/api/v1/memories/context",
+        headers=auth_headers(),
+        json={
+            "namespace": "team-a",
+            "subject_id": "subject-1",
+            "query": "用户偏好",
+            "limit": 15,
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "以下是关于该用户的关键记忆" in data["context"]
+    assert data["count"] == 2
+    assert len(data["sources"]) == 2
+    assert "prompt_block" not in data
+    assert "usage_hint" not in data
+
+
 def test_add_memory_rejects_unauthorized_namespace():
     client = build_app()
     response = client.post(
@@ -92,7 +125,7 @@ def test_subject_context_route_uses_subject_prefix(monkeypatch):
     client = build_app()
     response = client.put(
         "/api/v1/subjects/subject-1/context",
-        headers=auth_headers(scopes=["context:write"]),
+        headers=auth_headers(),
         json={
             "namespace": "team-a",
             "name": "Alice",
@@ -217,3 +250,59 @@ async def test_mem0_service_search_passes_filters(monkeypatch):
     assert fake_client.search_calls[0]["run_id"] == "session-1"
     assert fake_client.search_calls[0]["filters"] == {"category": "preference"}
     assert results[0]["text"] == "prefers python"
+
+
+@pytest.mark.asyncio
+async def test_mem0_service_context_v2_deduplicates_and_builds_sections(monkeypatch):
+    async def fake_search_memories(**kwargs):
+        return [
+            {
+                "id": "m1",
+                "text": "用户喜欢 Python",
+                "score": 0.95,
+                "metadata": {"category": "preference"},
+                "created_at": "2026-03-06T10:00:00+00:00",
+            },
+            {
+                "id": "m2",
+                "text": "用户在上海工作",
+                "score": 0.88,
+                "metadata": {"category": "profile"},
+                "created_at": "2026-03-05T10:00:00+00:00",
+            },
+        ]
+
+    async def fake_get_all_memories(**kwargs):
+        return [
+            {
+                "id": "m2",
+                "text": "用户在上海工作",
+                "score": None,
+                "metadata": {"category": "profile"},
+                "created_at": "2026-03-05T10:00:00+00:00",
+            },
+            {
+                "id": "m3",
+                "text": "最近在评估 LangGraph 方案",
+                "score": None,
+                "metadata": {"category": "recent"},
+                "created_at": "2026-03-06T12:00:00+00:00",
+            },
+        ]
+
+    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
+    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+
+    result = await mem0_service.get_context_for_llm(
+        namespace="team-a",
+        subject_id="subject-1",
+        query="用户背景和最近在做什么",
+        limit=10,
+    )
+
+    assert "以下是与当前问题最相关的用户记忆" in result["context"]
+    assert len(result["sources"]) == 3
+    assert "prompt_block" not in result
+    assert "usage_hint" not in result
+    assert "用户喜欢 Python" in result["context"]
+    assert "最近在评估 LangGraph 方案" in result["context"]

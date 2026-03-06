@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import secrets
 from typing import Any, Dict, List, Optional
 
@@ -7,7 +8,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 from app.core.config import settings
-from app.database.mongodb import get_service_client_collection
+from app.database.mongodb import get_service_client_collection, get_service_token_collection
 from app.models.schemas import AuthContext
 
 # 密码加密
@@ -18,7 +19,6 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 class ServiceClient:
     client_id: str
     secret: str
-    scopes: List[str]
     namespaces: List[str]
 
 
@@ -46,7 +46,6 @@ class AuthService:
             return self._build_service_client(
                 client_id=client_id,
                 client_secret=client_secret,
-                scopes=mongo_client.get("scopes", []),
                 namespaces=mongo_client.get("namespaces", []),
             )
 
@@ -55,7 +54,6 @@ class AuthService:
     async def create_service_client(
         self,
         client_id: str,
-        scopes: List[str],
         namespaces: List[str],
         description: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -71,7 +69,6 @@ class AuthService:
             "_id": client_id,
             "client_id": client_id,
             "client_secret_hash": self.hash_password(client_secret),
-            "scopes": list(scopes),
             "namespaces": list(namespaces),
             "description": description,
             "created_at": now,
@@ -93,7 +90,6 @@ class AuthService:
     async def update_service_client(
         self,
         client_id: str,
-        scopes: Optional[List[str]] = None,
         namespaces: Optional[List[str]] = None,
         description: Optional[str] = None,
         is_active: Optional[bool] = None,
@@ -104,8 +100,6 @@ class AuthService:
             return None
 
         update_data: Dict[str, Any] = {"updated_at": datetime.now(timezone.utc)}
-        if scopes is not None:
-            update_data["scopes"] = list(scopes)
         if namespaces is not None:
             update_data["namespaces"] = list(namespaces)
         if description is not None:
@@ -153,7 +147,6 @@ class AuthService:
         return self._build_service_client(
             client_id=client_id,
             client_secret=client_secret,
-            scopes=client_config.get("scopes", []),
             namespaces=client_config.get("namespaces", []),
         )
 
@@ -170,13 +163,11 @@ class AuthService:
     def _build_service_client(
         client_id: str,
         client_secret: str,
-        scopes: List[str],
         namespaces: List[str],
     ) -> ServiceClient:
         return ServiceClient(
             client_id=client_id,
             secret=client_secret,
-            scopes=list(scopes),
             namespaces=list(namespaces),
         )
 
@@ -184,7 +175,6 @@ class AuthService:
     def _serialize_service_client(document: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "client_id": document["client_id"],
-            "scopes": list(document.get("scopes", [])),
             "namespaces": list(document.get("namespaces", [])),
             "description": document.get("description"),
             "created_at": document.get("created_at").isoformat() if document.get("created_at") else None,
@@ -195,32 +185,48 @@ class AuthService:
     def create_service_token(
         self,
         service_id: str,
-        scopes: List[str],
         namespaces: List[str],
         expires_delta: Optional[timedelta] = None,
     ) -> str:
-        expires_at = datetime.now(timezone.utc) + (
-            expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-        )
+        expires_at = self._resolve_token_expiry(expires_delta)
         payload = {
             "sub": service_id,
-            "scopes": scopes,
             "namespaces": namespaces,
             "exp": expires_at,
         }
         return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+    async def issue_service_token(
+        self,
+        service_id: str,
+        namespaces: List[str],
+        expires_delta: Optional[timedelta] = None,
+    ) -> str:
+        expires_at = self._resolve_token_expiry(expires_delta)
+        payload = {
+            "sub": service_id,
+            "namespaces": namespaces,
+            "exp": expires_at,
+        }
+        token = jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+        await self._persist_service_token(
+            token=token,
+            service_id=service_id,
+            namespaces=namespaces,
+            expires_at=expires_at,
+        )
+        return token
 
     def create_access_token(self, data: dict, expires_delta: Optional[timedelta] = None) -> str:
         """兼容旧调用，内部转为服务 token。"""
         to_encode = data.copy()
         return self.create_service_token(
             service_id=to_encode.get("sub", ""),
-            scopes=list(to_encode.get("scopes", [])),
             namespaces=list(to_encode.get("namespaces", [])),
             expires_delta=expires_delta,
         )
 
-    def verify_token(self, token: str) -> Optional[AuthContext]:
+    async def verify_token(self, token: str) -> Optional[AuthContext]:
         """验证 token 并返回服务身份上下文。"""
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
@@ -228,15 +234,25 @@ class AuthService:
             if service_id is None:
                 return None
 
-            scopes = payload.get("scopes", [])
             namespaces = payload.get("namespaces", [])
 
-            if not isinstance(scopes, list) or not isinstance(namespaces, list):
+            if not isinstance(namespaces, list):
                 return None
+
+            token_collection = await self._get_service_token_collection()
+            if token_collection is not None:
+                persisted_token = await token_collection.find_one({"_id": self._hash_token(token)})
+                if persisted_token is None:
+                    return None
+
+                expires_at = self._normalize_utc_datetime(persisted_token.get("expires_at"))
+                if persisted_token.get("is_active") is False:
+                    return None
+                if expires_at is not None and expires_at <= datetime.now(timezone.utc):
+                    return None
 
             return AuthContext(
                 service_id=service_id,
-                scopes=[str(scope) for scope in scopes],
                 namespaces=[str(namespace) for namespace in namespaces],
             )
         except JWTError:
@@ -252,6 +268,55 @@ class AuthService:
     def verify_password(self, plain_password: str, hashed_password: str) -> bool:
         """兼容旧用户数据结构的密码校验。"""
         return pwd_context.verify(plain_password, hashed_password)
+
+    @staticmethod
+    def _resolve_token_expiry(expires_delta: Optional[timedelta]) -> datetime:
+        return datetime.now(timezone.utc) + (
+            expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        )
+
+    @staticmethod
+    def _normalize_utc_datetime(value: Any) -> Optional[datetime]:
+        if not isinstance(value, datetime):
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _hash_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    async def _persist_service_token(
+        self,
+        token: str,
+        service_id: str,
+        namespaces: List[str],
+        expires_at: datetime,
+    ) -> None:
+        collection = await self._get_service_token_collection()
+        if collection is None:
+            return
+
+        now = datetime.now(timezone.utc)
+        await collection.insert_one(
+            {
+                "_id": self._hash_token(token),
+                "service_id": service_id,
+                "namespaces": list(namespaces),
+                "expires_at": expires_at,
+                "created_at": now,
+                "updated_at": now,
+                "is_active": True,
+            }
+        )
+
+    @staticmethod
+    async def _get_service_token_collection():
+        try:
+            return await get_service_token_collection()
+        except TypeError:
+            return None
 
 
 # 全局实例

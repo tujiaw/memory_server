@@ -6,6 +6,8 @@ from app.models.schemas import (
     MemoryAdd,
     ConversationMemory,
     BatchMemoryResponse,
+    MemoryContextRequest,
+    MemoryContextResponse,
     MemoryDelete,
     MemoryListResponse,
     MemoryResponse,
@@ -26,7 +28,7 @@ async def add_memory(
 ):
     """Add a new memory for a subject inside a namespace."""
     try:
-        authorize_namespace(auth_context, request.namespace, "memory:write")
+        authorize_namespace(auth_context, request.namespace)
         result = await mem0_service.add_memory(
             namespace=request.namespace,
             subject_id=request.subject_id,
@@ -45,6 +47,31 @@ async def add_memory(
         )
 
 
+@router.post("/context", response_model=MemoryContextResponse)
+async def get_memory_context(
+    request: MemoryContextRequest,
+    auth_context: Annotated[AuthContext, Depends(get_auth_context)],
+):
+    """获取可直接注入大模型的记忆上下文。有 query 时语义检索，无 query 时取最近记忆。"""
+    try:
+        authorize_namespace(auth_context, request.namespace)
+        result = await mem0_service.get_context_for_llm(
+            namespace=request.namespace,
+            subject_id=request.subject_id,
+            query=request.query,
+            limit=request.limit,
+            run_id=request.run_id,
+        )
+        return MemoryContextResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get memory context: {str(e)}",
+        )
+
+
 @router.post("/search", response_model=MemoryListResponse)
 async def search_memories(
     request: MemorySearch,
@@ -52,7 +79,7 @@ async def search_memories(
 ):
     """Search memories by namespace, subject, and optional run."""
     try:
-        authorize_namespace(auth_context, request.namespace, "memory:read")
+        authorize_namespace(auth_context, request.namespace)
         results = await mem0_service.search_memories(
             namespace=request.namespace,
             subject_id=request.subject_id,
@@ -81,7 +108,7 @@ async def get_all_memories(
 ):
     """Get all memories for a subject."""
     try:
-        authorize_namespace(auth_context, namespace, "memory:read")
+        authorize_namespace(auth_context, namespace)
         results = await mem0_service.get_all_memories(
             namespace=namespace,
             subject_id=subject_id,
@@ -105,7 +132,7 @@ async def update_memory(
 ):
     """Update an existing memory's content."""
     try:
-        authorize_namespace(auth_context, request.namespace, "memory:write")
+        authorize_namespace(auth_context, request.namespace)
         result = await mem0_service.update_memory(
             namespace=request.namespace,
             subject_id=request.subject_id,
@@ -129,7 +156,7 @@ async def delete_memory(
 ):
     """Delete a memory by ID."""
     try:
-        authorize_namespace(auth_context, request.namespace, "memory:write")
+        authorize_namespace(auth_context, request.namespace)
         await mem0_service.delete_memory(
             namespace=request.namespace,
             subject_id=request.subject_id,
@@ -151,7 +178,7 @@ async def add_memories_batch(
 ):
     """Add multiple subject memories in a single request."""
     try:
-        authorize_namespace(auth_context, request.namespace, "memory:write")
+        authorize_namespace(auth_context, request.namespace)
         result = await mem0_service.add_memories_batch(
             namespace=request.namespace,
             subject_id=request.subject_id,
@@ -176,7 +203,7 @@ async def add_conversation_memory(
 ):
     """Extract memories from structured conversation messages."""
     try:
-        authorize_namespace(auth_context, request.namespace, "memory:write")
+        authorize_namespace(auth_context, request.namespace)
         result = await mem0_service.add_conversation_memory(
             namespace=request.namespace,
             subject_id=request.subject_id,

@@ -138,6 +138,43 @@ class Mem0Service:
             results = payload or []
         return [self._normalize_memory_result(result) for result in results]
 
+    @staticmethod
+    def _deduplicate_memory_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        deduplicated: List[Dict[str, Any]] = []
+        seen_keys = set()
+
+        for item in items:
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue
+
+            dedupe_key = (item.get("id"), text)
+            if dedupe_key in seen_keys:
+                continue
+
+            seen_keys.add(dedupe_key)
+            deduplicated.append(item)
+
+        return deduplicated
+
+    @staticmethod
+    def _sort_memories_by_recency(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        def sort_key(item: Dict[str, Any]) -> str:
+            return str(item.get("updated_at") or item.get("created_at") or "")
+
+        return sorted(items, key=sort_key, reverse=True)
+
+    @staticmethod
+    def _build_context_text(query: Optional[str], items: List[Dict[str, Any]]) -> str:
+        if not items:
+            return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
+
+        title = "以下是与当前问题最相关的用户记忆：" if query and query.strip() else "以下是该用户的可用记忆："
+        lines = [f"{index + 1}. {item['text']}" for index, item in enumerate(items) if item.get("text")]
+        if not lines:
+            return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
+        return title + "\n\n" + "\n".join(lines)
+
     # ========================================================================
     # Basic Memory Operations
     # ========================================================================
@@ -212,6 +249,41 @@ class Mem0Service:
             limit=limit or 100,
         )
         return self._normalize_results(results)
+
+    async def get_context_for_llm(
+        self,
+        namespace: str,
+        subject_id: str,
+        query: Optional[str] = None,
+        limit: int = 15,
+        run_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """获取适合直接注入 LLM 的 RAG 风格上下文。"""
+        task_relevant_memories: List[Dict[str, Any]] = []
+        if query and query.strip():
+            task_relevant_memories = await self.search_memories(
+                namespace=namespace,
+                subject_id=subject_id,
+                query=query.strip(),
+                limit=limit,
+                run_id=run_id,
+            )
+
+        recent_memories = await self.get_all_memories(
+            namespace=namespace,
+            subject_id=subject_id,
+            limit=limit,
+            run_id=run_id,
+        )
+        recent_memories = self._sort_memories_by_recency(self._deduplicate_memory_items(recent_memories))
+
+        merged_items = self._deduplicate_memory_items(task_relevant_memories + recent_memories)
+        result: Dict[str, Any] = {
+            "context": self._build_context_text(query=query, items=merged_items),
+            "count": len(merged_items),
+            "sources": merged_items,
+        }
+        return result
 
     async def update_memory(
         self,

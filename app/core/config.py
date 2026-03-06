@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     MONGO_COLLECTION_USERS: str = "users"
     MONGO_COLLECTION_SUBJECTS: str = "subjects"
     MONGO_COLLECTION_SERVICE_CLIENTS: str = "service_clients"
+    MONGO_COLLECTION_SERVICE_TOKENS: str = "service_tokens"
 
     # OpenAI Configuration
     OPENAI_API_KEY: str

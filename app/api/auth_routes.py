@@ -22,16 +22,14 @@ async def issue_token(request: ServiceTokenRequest):
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    access_token = auth_service.create_service_token(
+    access_token = await auth_service.issue_service_token(
         service_id=service_client.client_id,
-        scopes=service_client.scopes,
         namespaces=service_client.namespaces,
     )
 
     return ServiceTokenResponse(
         access_token=access_token,
         service_id=service_client.client_id,
-        scopes=service_client.scopes,
         namespaces=service_client.namespaces,
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )

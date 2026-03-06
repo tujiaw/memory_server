@@ -9,7 +9,7 @@ os.environ.setdefault("OPENAI_API_BASE", "https://example.com/v1")
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
 os.environ.setdefault(
     "SERVICE_CLIENTS_JSON",
-    '{"svc-agent":{"secret":"top-secret","scopes":["memory:read","memory:write","context:read","context:write"],"namespaces":["team-a"]}}',
+    '{"svc-agent":{"secret":"top-secret","namespaces":["team-a"]}}',
 )
 
 import main

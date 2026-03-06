@@ -26,7 +26,6 @@ async def create_service_client(request: AdminClientCreateRequest):
     try:
         client = await auth_service.create_service_client(
             client_id=request.client_id,
-            scopes=request.scopes,
             namespaces=request.namespaces,
             description=request.description,
         )
@@ -50,7 +49,6 @@ async def update_service_client(client_id: str, request: AdminClientUpdateReques
     """Update a managed service client."""
     client = await auth_service.update_service_client(
         client_id=client_id,
-        scopes=request.scopes,
         namespaces=request.namespaces,
         description=request.description,
         is_active=request.is_active,

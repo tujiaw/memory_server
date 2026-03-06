@@ -56,7 +56,6 @@ docker compose up --build
 {
   "svc-agent": {
     "secret": "replace-me",
-    "scopes": ["memory:read", "memory:write", "context:read", "context:write"],
     "namespaces": ["team-a"]
   }
 }
@@ -192,7 +191,7 @@ Content-Type: application/json
 {
   "success": false,
   "code": "HTTP_403",
-  "message": "Missing required scope: memory:write"
+  "message": "Service 'svc-agent' cannot access namespace 'team-b'"
 }
 ```
 
