@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import logging
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException, Request, Response, status
@@ -12,6 +13,11 @@ from app.api.auth_routes import router as auth_router
 from app.api.mem0_routes import router as memories_router
 from app.api.user_routes import router as users_router
 from app.database.mongodb import mongodb
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
 
 def build_error_response(
@@ -136,7 +142,7 @@ async def collect_health_status() -> Dict[str, Any]:
     except Exception:
         services["qdrant"] = "unhealthy"
 
-    if not settings.OPENAI_API_KEY or not settings.OPENAI_API_BASE:
+    if not settings.OPENAI_API_KEY or not settings.OPENAI_BASE_URL:
         services["openai_config"] = "unhealthy"
 
     overall_status = "healthy" if all(state == "healthy" for state in services.values()) else "degraded"
@@ -160,4 +166,5 @@ if __name__ == "__main__":
         host=settings.HOST,
         port=settings.PORT,
         reload=settings.DEBUG,
+        log_level="info",
     )

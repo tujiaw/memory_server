@@ -6,7 +6,7 @@ import pytest
 
 
 os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
-os.environ.setdefault("OPENAI_API_BASE", "https://example.com/v1")
+os.environ.setdefault("OPENAI_BASE_URL", "https://example.com/v1")
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
 os.environ.setdefault(
     "SERVICE_CLIENTS_JSON",

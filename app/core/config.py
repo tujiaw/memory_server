@@ -36,7 +36,7 @@ class Settings(BaseSettings):
 
     # OpenAI Configuration
     OPENAI_API_KEY: str
-    OPENAI_API_BASE: str
+    OPENAI_BASE_URL: str
     OPENAI_MODEL: str = "gpt-4o-mini"
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
 
@@ -80,4 +80,4 @@ settings = Settings()
 import os
 
 os.environ["OPENAI_API_KEY"] = settings.OPENAI_API_KEY
-os.environ["OPENAI_API_BASE"] = settings.OPENAI_API_BASE
+os.environ["OPENAI_BASE_URL"] = settings.OPENAI_BASE_URL

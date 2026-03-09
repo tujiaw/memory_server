@@ -1,4 +1,6 @@
 import re
+import logging
+from time import perf_counter
 from typing import Any, Dict, List, Optional
 
 from mem0 import Memory
@@ -6,6 +8,8 @@ from openai import AsyncOpenAI
 
 from app.core.config import settings
 from app.services.user_service import user_service
+
+logger = logging.getLogger(__name__)
 
 
 class Mem0Service:
@@ -362,7 +366,7 @@ class Mem0Service:
         if self._openai_client is None:
             self._openai_client = AsyncOpenAI(
                 api_key=settings.OPENAI_API_KEY,
-                base_url=settings.OPENAI_API_BASE,
+                base_url=settings.OPENAI_BASE_URL,
             )
         return self._openai_client
 
@@ -529,33 +533,42 @@ class Mem0Service:
         run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """获取适合直接注入 LLM 的 RAG 风格上下文。"""
+        total_start = perf_counter()
         normalized_query = query.strip() if query and query.strip() else None
         enhanced_query: Optional[str] = None
         history_used: List[str] = []
         task_relevant_memories: List[Dict[str, Any]] = []
         relevant_relations: List[Dict[str, Any]] = []
 
+        recent_fetch_start = perf_counter()
         recent_memory_result = await self.get_all_memories_with_relations(
             namespace=namespace,
             subject_id=subject_id,
             limit=limit,
             run_id=run_id,
         )
+        recent_fetch_ms = (perf_counter() - recent_fetch_start) * 1000
         recent_memories = recent_memory_result["items"]
         recent_memories = self._sort_memories_by_recency(self._deduplicate_memory_items(recent_memories))
         recent_relations = recent_memory_result["relations"]
+        rewrite_ms = 0.0
+        relevant_fetch_ms = 0.0
 
         if normalized_query:
             candidate_history = self._select_history_for_query_enhancement(recent_memories)
             try:
+                rewrite_start = perf_counter()
                 rewritten_query = await self._rewrite_query_with_llm(normalized_query, candidate_history)
+                rewrite_ms = (perf_counter() - rewrite_start) * 1000
                 enhanced_query = rewritten_query.strip() or normalized_query
                 if enhanced_query != normalized_query:
                     history_used = candidate_history
             except Exception:
                 enhanced_query = normalized_query
                 history_used = []
+                rewrite_ms = (perf_counter() - rewrite_start) * 1000
 
+            relevant_fetch_start = perf_counter()
             relevant_memory_result = await self.search_memories_with_relations(
                 namespace=namespace,
                 subject_id=subject_id,
@@ -563,6 +576,7 @@ class Mem0Service:
                 limit=limit,
                 run_id=run_id,
             )
+            relevant_fetch_ms = (perf_counter() - relevant_fetch_start) * 1000
             task_relevant_memories = relevant_memory_result["items"]
             task_relevant_memories = self._filter_relevant_memories_by_score(
                 task_relevant_memories,
@@ -570,9 +584,11 @@ class Mem0Service:
             )
             relevant_relations = relevant_memory_result["relations"]
 
+        merge_start = perf_counter()
         grouped_sources = self._merge_context_sources(task_relevant_memories, recent_memories)
         merged_items = grouped_sources["relevant"] + grouped_sources["recent"]
         merged_relations = self._normalize_relations({"relations": relevant_relations + recent_relations})
+        merge_ms = (perf_counter() - merge_start) * 1000
         result: Dict[str, Any] = {
             "context": self._build_context_text(
                 query=normalized_query,
@@ -587,6 +603,24 @@ class Mem0Service:
             "sources": merged_items,
             "relations": merged_relations,
         }
+        total_ms = (perf_counter() - total_start) * 1000
+        logger.info(
+            (
+                "get_context_for_llm timing | namespace=%s subject_id=%s has_query=%s "
+                "recent_fetch_ms=%.2f rewrite_ms=%.2f relevant_fetch_ms=%.2f merge_ms=%.2f total_ms=%.2f "
+                "sources=%d relations=%d"
+            ),
+            namespace,
+            subject_id,
+            bool(normalized_query),
+            recent_fetch_ms,
+            rewrite_ms,
+            relevant_fetch_ms,
+            merge_ms,
+            total_ms,
+            len(merged_items),
+            len(merged_relations),
+        )
         return result
 
     async def update_memory(

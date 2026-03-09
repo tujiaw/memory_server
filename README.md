@@ -46,7 +46,7 @@ docker compose up --build
 `.env` 至少需要配置：
 
 - `OPENAI_API_KEY`
-- `OPENAI_API_BASE`
+- `OPENAI_BASE_URL`
 - `SECRET_KEY`
 - `SERVICE_CLIENTS_JSON`
 
