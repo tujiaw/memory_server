@@ -398,7 +398,6 @@ class Mem0Service:
         client = self._get_openai_client()
         response = await client.chat.completions.create(
             model=settings.OPENAI_MODEL,
-            temperature=0,
             messages=[
                 {
                     "role": "system",
