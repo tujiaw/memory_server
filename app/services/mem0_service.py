@@ -273,21 +273,55 @@ class Mem0Service:
             return None
         return title + "\n\n" + "\n".join(lines)
 
+    @staticmethod
+    def _build_relations_section(relations: List[Dict[str, Any]]) -> Optional[str]:
+        lines: List[str] = []
+        for index, relation in enumerate(relations):
+            source = relation.get("source")
+            relationship = relation.get("relationship")
+            target = relation.get("target")
+            if not source or not relationship or not target:
+                continue
+            lines.append(f"{index + 1}. {source} --{relationship}--> {target}")
+        if not lines:
+            return None
+        return "以下是可用于推理的关系图谱（三元组）：\n\n" + "\n".join(lines)
+
+    @staticmethod
+    def _build_context_usage_guideline() -> str:
+        return (
+            "回答规则：\n"
+            "1. 优先使用关系图谱中的结构化事实。\n"
+            "2. 若与记忆文本存在冲突，优先采用更近期、更具体的信息。\n"
+            "3. 若证据不足，明确说明不确定并向用户追问。\n"
+            "4. 不要编造上下文中不存在的事实。"
+        )
+
     def _build_context_text(
         self,
         query: Optional[str],
         relevant_items: List[Dict[str, Any]],
         recent_items: List[Dict[str, Any]],
+        relations: List[Dict[str, Any]],
     ) -> str:
         all_items = relevant_items + recent_items
-        if not all_items:
+        if not all_items and not relations:
             return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
 
+        relation_section = self._build_relations_section(relations)
+        guidance_section = self._build_context_usage_guideline()
+
         if not query or not query.strip():
+            sections: List[str] = []
             recent_section = self._build_memory_section("以下是该用户的可用记忆：", recent_items)
             if recent_section:
-                return recent_section
-            return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
+                sections.append(recent_section)
+            if relation_section:
+                sections.append(relation_section)
+            if not sections:
+                return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
+            sections.append(guidance_section)
+            return "\n\n".join(sections)
 
         sections: List[str] = []
         relevant_section = self._build_memory_section("以下是与当前问题最相关的用户记忆：", relevant_items)
@@ -298,8 +332,12 @@ class Mem0Service:
         if recent_section:
             sections.append(recent_section)
 
+        if relation_section:
+            sections.append(relation_section)
+
         if not sections:
             return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
+        sections.append(guidance_section)
         return "\n\n".join(sections)
 
     @staticmethod
@@ -540,6 +578,7 @@ class Mem0Service:
                 query=normalized_query,
                 relevant_items=grouped_sources["relevant"],
                 recent_items=grouped_sources["recent"],
+                relations=merged_relations,
             ),
             "count": len(merged_items),
             "query": normalized_query,

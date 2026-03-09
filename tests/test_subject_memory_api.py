@@ -423,6 +423,9 @@ async def test_mem0_service_context_uses_llm_rewritten_query(monkeypatch):
     assert "usage_hint" not in result
     assert "以下是与当前问题最相关的用户记忆" in result["context"]
     assert "以下是最近记忆补充" in result["context"]
+    assert "以下是可用于推理的关系图谱（三元组）" in result["context"]
+    assert "user1 --works_in--> 上海" in result["context"]
+    assert "回答规则：" in result["context"]
     assert "用户喜欢 Python" in result["context"]
     assert "最近在评估 LangGraph 方案" in result["context"]
 
@@ -654,6 +657,7 @@ async def test_mem0_service_context_without_query_returns_recent_memories_only(m
     )
 
     assert "以下是该用户的可用记忆" in result["context"]
+    assert "回答规则：" in result["context"]
     assert result["query"] is None
     assert result["enhanced_query"] is None
     assert result["history_used"] == []
