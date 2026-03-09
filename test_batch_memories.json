@@ -1,0 +1,51 @@
+{
+  "namespace": "测试空间",
+  "subject_id": "user2",
+  "memories": [
+    {
+      "content": "我最喜欢的颜色是蓝色，平时喜欢穿蓝色的衣服。",
+      "metadata": {"category": "preferences", "type": "color"}
+    },
+    {
+      "content": "我是一名前端工程师，主要使用 React 和 Vue 进行开发。",
+      "metadata": {"category": "professional", "type": "skills"}
+    },
+    {
+      "content": "我非常喜欢吃辣，尤其是四川火锅和重庆火锅。",
+      "metadata": {"category": "preferences", "type": "food"}
+    },
+    {
+      "content": "周末我通常会去打篮球或者去图书馆看书。",
+      "metadata": {"category": "lifestyle", "type": "hobbies"}
+    },
+    {
+      "content": "我有一只叫做'橘子'的橘猫，今年两岁了。",
+      "metadata": {"category": "personal", "type": "pets"}
+    },
+    {
+      "content": "我最近在学习 Python 和后端的知识，打算往全栈方向发展。",
+      "metadata": {"category": "professional", "type": "learning"}
+    },
+    {
+      "content": "我对海鲜过敏，所以平时吃饭都会特意避开海鲜类食物。",
+      "metadata": {"category": "health", "type": "dietary_restrictions"}
+    },
+    {
+      "content": "我计划明年去日本旅行，目前正在学习一些基础的日语。",
+      "metadata": {"category": "lifestyle", "type": "travel"}
+    },
+    {
+      "content": "我比较习惯晚上工作，通常会熬夜到凌晨两点，属于典型的夜猫子。",
+      "metadata": {"category": "lifestyle", "type": "routine"}
+    },
+    {
+      "content": "我不喜欢喝咖啡，平时提神主要靠喝绿茶或者乌龙茶。",
+      "metadata": {"category": "preferences", "type": "drinks"}
+    }
+  ],
+  "metadata": {
+    "source": "batch_test_data",
+    "batch_id": "test_001"
+  },
+  "infer": true
+}

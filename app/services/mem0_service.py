@@ -1,5 +1,6 @@
 import re
 import logging
+import asyncio
 from time import perf_counter
 from typing import Any, Dict, List, Optional
 
@@ -16,27 +17,18 @@ class Mem0Service:
     """Service for managing subject-scoped memories on top of mem0."""
 
     def __init__(self):
-        self._memories: Dict[str, Memory] = {}
-        self._vector_only_memories: Dict[str, Memory] = {}
+        self._memory_client: Optional[Memory] = None
+        self._vector_only_memory_client: Optional[Memory] = None
         self._openai_client: Optional[AsyncOpenAI] = None
 
     @staticmethod
-    def _scope_key(namespace: str, subject_id: str) -> str:
-        return f"{namespace}:{subject_id}"
-
-    @staticmethod
-    def _collection_name(namespace: str, subject_id: str) -> str:
-        raw_name = f"{namespace}_{subject_id}"
-        safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_name)
-        return f"mem0_{safe_name}"
-
-    def _get_config(self, namespace: str, subject_id: str) -> dict:
-        """Generate mem0 configuration for a specific subject scope."""
+    def _get_global_config() -> dict:
+        """Generate a global mem0 configuration using a single collection."""
         config = {
             "vector_store": {
                 "provider": "qdrant",
                 "config": {
-                    "collection_name": self._collection_name(namespace, subject_id),
+                    "collection_name": "mem0_global_memory",  # 关键改变：全局唯一的集合名称
                     "host": settings.QDRANT_HOST,
                     "port": settings.QDRANT_PORT,
                     "embedding_model_dims": settings.VECTOR_SIZE,
@@ -71,22 +63,20 @@ class Mem0Service:
                 config["graph_store"]["custom_prompt"] = settings.MEM0_GRAPH_CUSTOM_PROMPT
         return config
 
-    def get_memory_client(self, namespace: str, subject_id: str) -> Memory:
-        """Get or create a Memory client for a subject scope."""
-        scope_key = self._scope_key(namespace, subject_id)
-        if scope_key not in self._memories:
-            config = self._get_config(namespace, subject_id)
-            self._memories[scope_key] = Memory.from_config(config)
-        return self._memories[scope_key]
+    def _get_memory_client(self) -> Memory:
+        """Get or create the global Memory client."""
+        if self._memory_client is None:
+            config = self._get_global_config()
+            self._memory_client = Memory.from_config(config)
+        return self._memory_client
 
-    def get_vector_only_memory_client(self, namespace: str, subject_id: str) -> Memory:
-        """Get or create a vector-only Memory client (without graph store)."""
-        scope_key = self._scope_key(namespace, subject_id)
-        if scope_key not in self._vector_only_memories:
-            config = dict(self._get_config(namespace, subject_id))
+    def _get_vector_only_memory_client(self) -> Memory:
+        """Get or create the global vector-only Memory client (without graph store)."""
+        if self._vector_only_memory_client is None:
+            config = dict(self._get_global_config())
             config.pop("graph_store", None)
-            self._vector_only_memories[scope_key] = Memory.from_config(config)
-        return self._vector_only_memories[scope_key]
+            self._vector_only_memory_client = Memory.from_config(config)
+        return self._vector_only_memory_client
 
     async def _get_subject_context(self, namespace: str, subject_id: str) -> Dict[str, Any]:
         subject = await user_service.get_subject_context(namespace, subject_id)
@@ -426,9 +416,10 @@ class Mem0Service:
         infer: bool = True,
     ) -> Dict[str, Any]:
         """Add a new memory for a subject."""
-        memory_client = self.get_memory_client(namespace, subject_id)
+        memory_client = self._get_memory_client()
         subject_context = await self._get_subject_context(namespace, subject_id)
-        result = memory_client.add(
+        result = await asyncio.to_thread(
+            memory_client.add,
             messages=self._prepare_messages(content, subject_context),
             user_id=subject_id,
             agent_id=namespace,
@@ -462,8 +453,9 @@ class Mem0Service:
         run_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        memory_client = self.get_memory_client(namespace, subject_id)
-        results = memory_client.search(
+        memory_client = self._get_memory_client()
+        results = await asyncio.to_thread(
+            memory_client.search,
             query=query,
             user_id=subject_id,
             agent_id=namespace,
@@ -504,8 +496,9 @@ class Mem0Service:
         limit: Optional[int] = None,
         run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        memory_client = self.get_memory_client(namespace, subject_id)
-        results = memory_client.get_all(
+        memory_client = self._get_memory_client()
+        results = await asyncio.to_thread(
+            memory_client.get_all,
             user_id=subject_id,
             agent_id=namespace,
             run_id=run_id,
@@ -540,8 +533,9 @@ class Mem0Service:
         limit: int,
         run_id: Optional[str],
     ) -> Dict[str, Any]:
-        memory_client = self.get_vector_only_memory_client(namespace, subject_id)
-        results = memory_client.search(
+        memory_client = self._get_vector_only_memory_client()
+        results = await asyncio.to_thread(
+            memory_client.search,
             query=query,
             user_id=subject_id,
             agent_id=namespace,
@@ -561,8 +555,9 @@ class Mem0Service:
         limit: int,
         run_id: Optional[str],
     ) -> Dict[str, Any]:
-        memory_client = self.get_vector_only_memory_client(namespace, subject_id)
-        results = memory_client.get_all(
+        memory_client = self._get_vector_only_memory_client()
+        results = await asyncio.to_thread(
+            memory_client.get_all,
             user_id=subject_id,
             agent_id=namespace,
             run_id=run_id,
@@ -615,10 +610,10 @@ class Mem0Service:
         relevant_fetch_ms = 0.0
 
         if normalized_query:
-            candidate_history = self._select_history_for_query_enhancement(recent_memories)
             rewrite_start = perf_counter()
             try:
                 if enable_query_rewrite:
+                    candidate_history = self._select_history_for_query_enhancement(recent_memories)
                     rewritten_query = await self._rewrite_query_with_llm(normalized_query, candidate_history)
                     enhanced_query = rewritten_query.strip() or normalized_query
                     if enhanced_query != normalized_query:
@@ -706,8 +701,12 @@ class Mem0Service:
         content: str,
     ) -> Dict[str, Any]:
         """Update an existing memory."""
-        memory_client = self.get_memory_client(namespace, subject_id)
-        result = memory_client.update(memory_id=memory_id, data=content)
+        memory_client = self._get_memory_client()
+        result = await asyncio.to_thread(
+            memory_client.update,
+            memory_id=memory_id,
+            data=content,
+        )
         await user_service.touch_subject(namespace, subject_id)
         return {
             "id": memory_id,
@@ -723,8 +722,8 @@ class Mem0Service:
 
     async def delete_memory(self, namespace: str, subject_id: str, memory_id: str) -> bool:
         """Delete a memory by ID."""
-        memory_client = self.get_memory_client(namespace, subject_id)
-        memory_client.delete(memory_id=memory_id)
+        memory_client = self._get_memory_client()
+        await asyncio.to_thread(memory_client.delete, memory_id=memory_id)
         await user_service.touch_subject(namespace, subject_id)
         return True
 
@@ -783,9 +782,10 @@ class Mem0Service:
         infer: bool = True,
     ) -> Dict[str, Any]:
         """Extract and store memories from structured conversation messages."""
-        memory_client = self.get_memory_client(namespace, subject_id)
+        memory_client = self._get_memory_client()
         subject_context = await self._get_subject_context(namespace, subject_id)
-        result = memory_client.add(
+        result = await asyncio.to_thread(
+            memory_client.add,
             messages=self._prepare_conversation_messages(messages, subject_context),
             user_id=subject_id,
             agent_id=namespace,
@@ -840,7 +840,7 @@ class Mem0Service:
                 "namespace": namespace,
                 "subject_id": subject_id,
                 "total_memories": 0,
-                "collection_name": self._collection_name(namespace, subject_id),
+                "collection_name": "mem0_global_memory",
             }
         all_memories = await self.get_all_memories(namespace=namespace, subject_id=subject_id)
         return {
@@ -849,18 +849,13 @@ class Mem0Service:
             "name": subject_stats.get("name"),
             "email": subject_stats.get("email"),
             "total_memories": len(all_memories),
-            "collection_name": self._collection_name(namespace, subject_id),
+            "collection_name": "mem0_global_memory",
             "created_at": subject_stats.get("created_at"),
             "last_active": subject_stats.get("last_active"),
         }
 
     def reset_subject(self, namespace: str, subject_id: str) -> bool:
-        """Remove a subject memory client from the local cache."""
-        scope_key = self._scope_key(namespace, subject_id)
-        if scope_key in self._memories:
-            del self._memories[scope_key]
-        if scope_key in self._vector_only_memories:
-            del self._vector_only_memories[scope_key]
+        """Reset operation is not applicable with a global memory client."""
         return True
 
 
