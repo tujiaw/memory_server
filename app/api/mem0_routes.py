@@ -36,6 +36,7 @@ async def add_memory(
             metadata=request.metadata,
             run_id=request.run_id,
             infer=request.infer,
+            enable_graph=request.enable_graph,
         )
         return MemoryResponse(success=True, message="Memory added successfully", data=result)
     except HTTPException:
@@ -199,6 +200,7 @@ async def add_memories_batch(
             metadata=request.metadata,
             run_id=request.run_id,
             infer=request.infer,
+            enable_graph=request.enable_graph,
         )
         return BatchMemoryResponse(**result)
     except HTTPException:
@@ -224,6 +226,7 @@ async def add_conversation_memory(
             metadata=request.metadata,
             run_id=request.run_id,
             infer=request.infer,
+            enable_graph=request.enable_graph,
         )
         return MemoryResponse(success=True, message="Conversation memories added", data=result)
     except HTTPException:

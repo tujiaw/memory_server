@@ -414,9 +414,11 @@ class Mem0Service:
         metadata: Optional[Dict[str, Any]] = None,
         run_id: Optional[str] = None,
         infer: bool = True,
+        enable_graph: bool = True,
     ) -> Dict[str, Any]:
         """Add a new memory for a subject."""
-        memory_client = self._get_memory_client()
+        # 根据参数决定使用带图谱的客户端，还是纯向量客户端
+        memory_client = self._get_memory_client() if enable_graph else self._get_vector_only_memory_client()
         subject_context = await self._get_subject_context(namespace, subject_id)
         result = await asyncio.to_thread(
             memory_client.add,
@@ -739,28 +741,32 @@ class Mem0Service:
         metadata: Optional[Dict[str, Any]] = None,
         run_id: Optional[str] = None,
         infer: bool = True,
+        enable_graph: bool = True,
     ) -> Dict[str, Any]:
         """Add multiple memories in batch."""
-        subject_context = await self._get_subject_context(namespace, subject_id)
-        results = []
-        failed = 0
-        for item in memories:
+        
+        async def _add_single(item: Dict[str, Any]):
             item_content = item["content"]
             item_metadata = dict(metadata or {})
             item_metadata.update(item.get("metadata") or {})
             try:
-                result = await self.add_memory(
+                return await self.add_memory(
                     namespace=namespace,
                     subject_id=subject_id,
                     content=item_content,
-                    metadata=self._build_metadata(item_metadata, subject_context),
+                    metadata=item_metadata,
                     run_id=run_id,
                     infer=infer,
+                    enable_graph=enable_graph,
                 )
-                results.append(result)
             except Exception as exc:
                 print(f"Failed to add memory: {exc}")
-                failed += 1
+                return None
+
+        tasks = [_add_single(item) for item in memories]
+        results_raw = await asyncio.gather(*tasks)
+        results = [r for r in results_raw if r is not None]
+        failed = len(memories) - len(results)
 
         return {
             "added_count": len(results),
@@ -780,9 +786,10 @@ class Mem0Service:
         metadata: Optional[Dict[str, Any]] = None,
         run_id: Optional[str] = None,
         infer: bool = True,
+        enable_graph: bool = True,
     ) -> Dict[str, Any]:
         """Extract and store memories from structured conversation messages."""
-        memory_client = self._get_memory_client()
+        memory_client = self._get_memory_client() if enable_graph else self._get_vector_only_memory_client()
         subject_context = await self._get_subject_context(namespace, subject_id)
         result = await asyncio.to_thread(
             memory_client.add,
