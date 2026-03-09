@@ -62,6 +62,8 @@ async def get_memory_context(
             limit=request.limit,
             min_score=request.min_score,
             run_id=request.run_id,
+            enable_query_rewrite=request.enable_query_rewrite,
+            enable_graph_search=request.enable_graph_search,
         )
         return MemoryContextResponse(**result)
     except HTTPException:

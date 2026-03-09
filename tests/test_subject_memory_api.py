@@ -106,6 +106,8 @@ def test_memory_context_returns_llm_ready_string(monkeypatch):
     assert data["enhanced_query"] == "用户的技术偏好和工作背景"
     assert data["history_used"] == ["用户喜欢 Python"]
     assert captured["min_score"] == 0.5
+    assert captured["enable_query_rewrite"] is True
+    assert captured["enable_graph_search"] is True
     assert len(data["sources"]) == 2
     assert data["relations"] == [{"source": "user1", "relationship": "works_in", "target": "上海"}]
     assert "prompt_block" not in data
@@ -662,3 +664,93 @@ async def test_mem0_service_context_without_query_returns_recent_memories_only(m
     assert result["enhanced_query"] is None
     assert result["history_used"] == []
     assert result["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mem0_service_context_can_disable_query_rewrite(monkeypatch):
+    captured = {}
+
+    async def fake_search_memories_with_relations(**kwargs):
+        captured["query"] = kwargs["query"]
+        return {"items": [], "relations": []}
+
+    async def fake_get_all_memories_with_relations(**kwargs):
+        return {
+            "items": [
+                {
+                    "id": "m1",
+                    "text": "用户喜欢 Python",
+                    "created_at": "2026-03-06T10:00:00+00:00",
+                }
+            ],
+            "relations": [],
+        }
+
+    async def fake_rewrite_query_with_llm(query, history_items):
+        raise AssertionError("_rewrite_query_with_llm should not be called when rewrite is disabled")
+
+    monkeypatch.setattr(mem0_service, "search_memories_with_relations", fake_search_memories_with_relations)
+    monkeypatch.setattr(mem0_service, "get_all_memories_with_relations", fake_get_all_memories_with_relations)
+    monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
+
+    result = await mem0_service.get_context_for_llm(
+        namespace="team-a",
+        subject_id="subject-1",
+        query="用户喜欢什么语言",
+        limit=5,
+        enable_query_rewrite=False,
+    )
+
+    assert captured["query"] == "用户喜欢什么语言"
+    assert result["enhanced_query"] == "用户喜欢什么语言"
+    assert result["history_used"] == []
+
+
+@pytest.mark.asyncio
+async def test_mem0_service_context_can_disable_graph_search(monkeypatch):
+    async def fail_get_all_memories_with_relations(**kwargs):
+        raise AssertionError("graph get_all should not be called when graph search is disabled")
+
+    async def fail_search_memories_with_relations(**kwargs):
+        raise AssertionError("graph search should not be called when graph search is disabled")
+
+    async def fake_get_all_memories_vector_only(**kwargs):
+        return {
+            "items": [
+                {
+                    "id": "m1",
+                    "text": "用户在上海工作",
+                    "created_at": "2026-03-06T10:00:00+00:00",
+                }
+            ],
+            "relations": [],
+        }
+
+    async def fake_search_memories_vector_only(**kwargs):
+        return {
+            "items": [
+                {
+                    "id": "m2",
+                    "text": "用户喜欢 Python",
+                    "score": 0.91,
+                    "created_at": "2026-03-06T11:00:00+00:00",
+                }
+            ],
+            "relations": [],
+        }
+
+    monkeypatch.setattr(mem0_service, "get_all_memories_with_relations", fail_get_all_memories_with_relations)
+    monkeypatch.setattr(mem0_service, "search_memories_with_relations", fail_search_memories_with_relations)
+    monkeypatch.setattr(mem0_service, "_get_all_memories_vector_only", fake_get_all_memories_vector_only, raising=False)
+    monkeypatch.setattr(mem0_service, "_search_memories_vector_only", fake_search_memories_vector_only, raising=False)
+
+    result = await mem0_service.get_context_for_llm(
+        namespace="team-a",
+        subject_id="subject-1",
+        query="用户背景",
+        limit=5,
+        enable_graph_search=False,
+    )
+
+    assert result["relations"] == []
+    assert [item["id"] for item in result["sources"]] == ["m2", "m1"]

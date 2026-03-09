@@ -17,6 +17,7 @@ class Mem0Service:
 
     def __init__(self):
         self._memories: Dict[str, Memory] = {}
+        self._vector_only_memories: Dict[str, Memory] = {}
         self._openai_client: Optional[AsyncOpenAI] = None
 
     @staticmethod
@@ -77,6 +78,15 @@ class Mem0Service:
             config = self._get_config(namespace, subject_id)
             self._memories[scope_key] = Memory.from_config(config)
         return self._memories[scope_key]
+
+    def get_vector_only_memory_client(self, namespace: str, subject_id: str) -> Memory:
+        """Get or create a vector-only Memory client (without graph store)."""
+        scope_key = self._scope_key(namespace, subject_id)
+        if scope_key not in self._vector_only_memories:
+            config = dict(self._get_config(namespace, subject_id))
+            config.pop("graph_store", None)
+            self._vector_only_memories[scope_key] = Memory.from_config(config)
+        return self._vector_only_memories[scope_key]
 
     async def _get_subject_context(self, namespace: str, subject_id: str) -> Dict[str, Any]:
         subject = await user_service.get_subject_context(namespace, subject_id)
@@ -523,6 +533,47 @@ class Mem0Service:
         )
         return result["items"]
 
+    async def _search_memories_vector_only(
+        self,
+        namespace: str,
+        subject_id: str,
+        query: str,
+        limit: int,
+        run_id: Optional[str],
+    ) -> Dict[str, Any]:
+        memory_client = self.get_vector_only_memory_client(namespace, subject_id)
+        results = memory_client.search(
+            query=query,
+            user_id=subject_id,
+            agent_id=namespace,
+            run_id=run_id,
+            limit=limit,
+        )
+        await user_service.touch_subject(namespace, subject_id)
+        return {
+            "items": self._normalize_results(results),
+            "relations": [],
+        }
+
+    async def _get_all_memories_vector_only(
+        self,
+        namespace: str,
+        subject_id: str,
+        limit: int,
+        run_id: Optional[str],
+    ) -> Dict[str, Any]:
+        memory_client = self.get_vector_only_memory_client(namespace, subject_id)
+        results = memory_client.get_all(
+            user_id=subject_id,
+            agent_id=namespace,
+            run_id=run_id,
+            limit=limit,
+        )
+        return {
+            "items": self._normalize_results(results),
+            "relations": [],
+        }
+
     async def get_context_for_llm(
         self,
         namespace: str,
@@ -531,6 +582,8 @@ class Mem0Service:
         limit: int = 15,
         min_score: float = 0.5,
         run_id: Optional[str] = None,
+        enable_query_rewrite: bool = True,
+        enable_graph_search: bool = True,
     ) -> Dict[str, Any]:
         """获取适合直接注入 LLM 的 RAG 风格上下文。"""
         total_start = perf_counter()
@@ -541,12 +594,20 @@ class Mem0Service:
         relevant_relations: List[Dict[str, Any]] = []
 
         recent_fetch_start = perf_counter()
-        recent_memory_result = await self.get_all_memories_with_relations(
-            namespace=namespace,
-            subject_id=subject_id,
-            limit=limit,
-            run_id=run_id,
-        )
+        if enable_graph_search:
+            recent_memory_result = await self.get_all_memories_with_relations(
+                namespace=namespace,
+                subject_id=subject_id,
+                limit=limit,
+                run_id=run_id,
+            )
+        else:
+            recent_memory_result = await self._get_all_memories_vector_only(
+                namespace=namespace,
+                subject_id=subject_id,
+                limit=limit,
+                run_id=run_id,
+            )
         recent_fetch_ms = (perf_counter() - recent_fetch_start) * 1000
         recent_memories = recent_memory_result["items"]
         recent_memories = self._sort_memories_by_recency(self._deduplicate_memory_items(recent_memories))
@@ -556,26 +617,38 @@ class Mem0Service:
 
         if normalized_query:
             candidate_history = self._select_history_for_query_enhancement(recent_memories)
+            rewrite_start = perf_counter()
             try:
-                rewrite_start = perf_counter()
-                rewritten_query = await self._rewrite_query_with_llm(normalized_query, candidate_history)
-                rewrite_ms = (perf_counter() - rewrite_start) * 1000
-                enhanced_query = rewritten_query.strip() or normalized_query
-                if enhanced_query != normalized_query:
-                    history_used = candidate_history
+                if enable_query_rewrite:
+                    rewritten_query = await self._rewrite_query_with_llm(normalized_query, candidate_history)
+                    enhanced_query = rewritten_query.strip() or normalized_query
+                    if enhanced_query != normalized_query:
+                        history_used = candidate_history
+                else:
+                    enhanced_query = normalized_query
+                    history_used = []
             except Exception:
                 enhanced_query = normalized_query
                 history_used = []
-                rewrite_ms = (perf_counter() - rewrite_start) * 1000
+            rewrite_ms = (perf_counter() - rewrite_start) * 1000
 
             relevant_fetch_start = perf_counter()
-            relevant_memory_result = await self.search_memories_with_relations(
-                namespace=namespace,
-                subject_id=subject_id,
-                query=enhanced_query,
-                limit=limit,
-                run_id=run_id,
-            )
+            if enable_graph_search:
+                relevant_memory_result = await self.search_memories_with_relations(
+                    namespace=namespace,
+                    subject_id=subject_id,
+                    query=enhanced_query,
+                    limit=limit,
+                    run_id=run_id,
+                )
+            else:
+                relevant_memory_result = await self._search_memories_vector_only(
+                    namespace=namespace,
+                    subject_id=subject_id,
+                    query=enhanced_query,
+                    limit=limit,
+                    run_id=run_id,
+                )
             relevant_fetch_ms = (perf_counter() - relevant_fetch_start) * 1000
             task_relevant_memories = relevant_memory_result["items"]
             task_relevant_memories = self._filter_relevant_memories_by_score(
@@ -607,12 +680,15 @@ class Mem0Service:
         logger.info(
             (
                 "get_context_for_llm timing | namespace=%s subject_id=%s has_query=%s "
+                "enable_query_rewrite=%s enable_graph_search=%s "
                 "recent_fetch_ms=%.2f rewrite_ms=%.2f relevant_fetch_ms=%.2f merge_ms=%.2f total_ms=%.2f "
                 "sources=%d relations=%d"
             ),
             namespace,
             subject_id,
             bool(normalized_query),
+            enable_query_rewrite,
+            enable_graph_search,
             recent_fetch_ms,
             rewrite_ms,
             relevant_fetch_ms,
@@ -784,6 +860,8 @@ class Mem0Service:
         scope_key = self._scope_key(namespace, subject_id)
         if scope_key in self._memories:
             del self._memories[scope_key]
+        if scope_key in self._vector_only_memories:
+            del self._vector_only_memories[scope_key]
         return True
 
 
