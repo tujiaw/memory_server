@@ -27,7 +27,7 @@ class Mem0Service:
 
     def _get_config(self, namespace: str, subject_id: str) -> dict:
         """Generate mem0 configuration for a specific subject scope."""
-        return {
+        config = {
             "vector_store": {
                 "provider": "qdrant",
                 "config": {
@@ -53,6 +53,18 @@ class Mem0Service:
             },
             "version": "v1.1",
         }
+        if settings.NEO4J_URL and settings.NEO4J_USERNAME and settings.NEO4J_PASSWORD:
+            config["graph_store"] = {
+                "provider": "neo4j",
+                "config": {
+                    "url": settings.NEO4J_URL,
+                    "username": settings.NEO4J_USERNAME,
+                    "password": settings.NEO4J_PASSWORD,
+                },
+            }
+            if settings.MEM0_GRAPH_CUSTOM_PROMPT:
+                config["graph_store"]["custom_prompt"] = settings.MEM0_GRAPH_CUSTOM_PROMPT
+        return config
 
     def get_memory_client(self, namespace: str, subject_id: str) -> Memory:
         """Get or create a Memory client for a subject scope."""
@@ -139,6 +151,53 @@ class Mem0Service:
         else:
             results = payload or []
         return [self._normalize_memory_result(result) for result in results]
+
+    @staticmethod
+    def _normalize_relation_item(result: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "source": result.get("source"),
+            "relationship": result.get("relationship") or result.get("relatationship"),
+            "target": result.get("target") or result.get("destination"),
+        }
+
+    @staticmethod
+    def _extract_relation_candidates(relations_payload: Any) -> List[Dict[str, Any]]:
+        if isinstance(relations_payload, list):
+            return [item for item in relations_payload if isinstance(item, dict)]
+
+        if not isinstance(relations_payload, dict):
+            return []
+
+        # mem0 add() graph output shape:
+        # {"deleted_entities": [...], "added_entities": [[{...}], ...]}
+        candidates: List[Dict[str, Any]] = []
+        added_entities = relations_payload.get("added_entities", [])
+        for entity_group in added_entities:
+            if isinstance(entity_group, list):
+                candidates.extend(item for item in entity_group if isinstance(item, dict))
+            elif isinstance(entity_group, dict):
+                candidates.append(entity_group)
+        return candidates
+
+    def _normalize_relations(self, payload: Any) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+
+        relations = self._extract_relation_candidates(payload.get("relations", []))
+        normalized_relations: List[Dict[str, Any]] = []
+        seen_keys = set()
+        for relation in relations:
+            normalized_relation = self._normalize_relation_item(relation)
+            dedupe_key = (
+                normalized_relation.get("source"),
+                normalized_relation.get("relationship"),
+                normalized_relation.get("target"),
+            )
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            normalized_relations.append(normalized_relation)
+        return normalized_relations
 
     @staticmethod
     def _deduplicate_memory_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -327,15 +386,44 @@ class Mem0Service:
             infer=infer,
         )
         normalized_results = self._normalize_results(result)
+        normalized_relations = self._normalize_relations(result)
         await self._track_successful_write(namespace, subject_id, len(normalized_results))
         if normalized_results:
-            return normalized_results[0]
+            return {
+                **normalized_results[0],
+                "relations": normalized_relations,
+            }
         return {
             "text": content,
             "metadata": metadata or {},
             "namespace": namespace,
             "subject_id": subject_id,
             "run_id": run_id,
+            "relations": normalized_relations,
+        }
+
+    async def search_memories_with_relations(
+        self,
+        namespace: str,
+        subject_id: str,
+        query: str,
+        limit: int = 5,
+        run_id: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        memory_client = self.get_memory_client(namespace, subject_id)
+        results = memory_client.search(
+            query=query,
+            user_id=subject_id,
+            agent_id=namespace,
+            run_id=run_id,
+            limit=limit,
+            filters=filters,
+        )
+        await user_service.touch_subject(namespace, subject_id)
+        return {
+            "items": self._normalize_results(results),
+            "relations": self._normalize_relations(results),
         }
 
     async def search_memories(
@@ -348,17 +436,34 @@ class Mem0Service:
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Search memories using semantic similarity."""
-        memory_client = self.get_memory_client(namespace, subject_id)
-        results = memory_client.search(
+        result = await self.search_memories_with_relations(
+            namespace=namespace,
+            subject_id=subject_id,
             query=query,
+            limit=limit,
+            run_id=run_id,
+            filters=filters,
+        )
+        return result["items"]
+
+    async def get_all_memories_with_relations(
+        self,
+        namespace: str,
+        subject_id: str,
+        limit: Optional[int] = None,
+        run_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        memory_client = self.get_memory_client(namespace, subject_id)
+        results = memory_client.get_all(
             user_id=subject_id,
             agent_id=namespace,
             run_id=run_id,
-            limit=limit,
-            filters=filters,
+            limit=limit or 100,
         )
-        await user_service.touch_subject(namespace, subject_id)
-        return self._normalize_results(results)
+        return {
+            "items": self._normalize_results(results),
+            "relations": self._normalize_relations(results),
+        }
 
     async def get_all_memories(
         self,
@@ -368,14 +473,13 @@ class Mem0Service:
         run_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Get all memories for a subject."""
-        memory_client = self.get_memory_client(namespace, subject_id)
-        results = memory_client.get_all(
-            user_id=subject_id,
-            agent_id=namespace,
+        result = await self.get_all_memories_with_relations(
+            namespace=namespace,
+            subject_id=subject_id,
+            limit=limit,
             run_id=run_id,
-            limit=limit or 100,
         )
-        return self._normalize_results(results)
+        return result["items"]
 
     async def get_context_for_llm(
         self,
@@ -391,14 +495,17 @@ class Mem0Service:
         enhanced_query: Optional[str] = None
         history_used: List[str] = []
         task_relevant_memories: List[Dict[str, Any]] = []
+        relevant_relations: List[Dict[str, Any]] = []
 
-        recent_memories = await self.get_all_memories(
+        recent_memory_result = await self.get_all_memories_with_relations(
             namespace=namespace,
             subject_id=subject_id,
             limit=limit,
             run_id=run_id,
         )
+        recent_memories = recent_memory_result["items"]
         recent_memories = self._sort_memories_by_recency(self._deduplicate_memory_items(recent_memories))
+        recent_relations = recent_memory_result["relations"]
 
         if normalized_query:
             candidate_history = self._select_history_for_query_enhancement(recent_memories)
@@ -411,20 +518,23 @@ class Mem0Service:
                 enhanced_query = normalized_query
                 history_used = []
 
-            task_relevant_memories = await self.search_memories(
+            relevant_memory_result = await self.search_memories_with_relations(
                 namespace=namespace,
                 subject_id=subject_id,
                 query=enhanced_query,
                 limit=limit,
                 run_id=run_id,
             )
+            task_relevant_memories = relevant_memory_result["items"]
             task_relevant_memories = self._filter_relevant_memories_by_score(
                 task_relevant_memories,
                 min_score=min_score,
             )
+            relevant_relations = relevant_memory_result["relations"]
 
         grouped_sources = self._merge_context_sources(task_relevant_memories, recent_memories)
         merged_items = grouped_sources["relevant"] + grouped_sources["recent"]
+        merged_relations = self._normalize_relations({"relations": relevant_relations + recent_relations})
         result: Dict[str, Any] = {
             "context": self._build_context_text(
                 query=normalized_query,
@@ -436,6 +546,7 @@ class Mem0Service:
             "enhanced_query": enhanced_query,
             "history_used": history_used,
             "sources": merged_items,
+            "relations": merged_relations,
         }
         return result
 
@@ -501,6 +612,7 @@ class Mem0Service:
                 )
                 results.append(result)
             except Exception as exc:
+                print(f"Failed to add memory: {exc}")
                 failed += 1
 
         return {
@@ -534,10 +646,12 @@ class Mem0Service:
             infer=infer,
         )
         normalized_results = self._normalize_results(result)
+        normalized_relations = self._normalize_relations(result)
         await self._track_successful_write(namespace, subject_id, len(normalized_results))
         return {
             "items": normalized_results,
             "count": len(normalized_results),
+            "relations": normalized_relations,
         }
 
     # ========================================================================

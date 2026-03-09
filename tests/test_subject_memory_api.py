@@ -15,6 +15,7 @@ os.environ.setdefault(
 
 from app.api.mem0_routes import router as memory_router
 from app.api.user_routes import router as subject_router
+from app.core.config import settings
 from app.services.auth_service import auth_service
 from app.services.mem0_service import mem0_service
 from app.services.user_service import user_service
@@ -78,6 +79,9 @@ def test_memory_context_returns_llm_ready_string(monkeypatch):
                 {"id": "m1", "text": "用户喜欢 Python", "score": 0.9},
                 {"id": "m2", "text": "用户在上海工作", "score": 0.85},
             ],
+            "relations": [
+                {"source": "user1", "relationship": "works_in", "target": "上海"},
+            ],
         }
 
     monkeypatch.setattr(mem0_service, "get_context_for_llm", fake_get_context_for_llm)
@@ -103,6 +107,7 @@ def test_memory_context_returns_llm_ready_string(monkeypatch):
     assert data["history_used"] == ["用户喜欢 Python"]
     assert captured["min_score"] == 0.5
     assert len(data["sources"]) == 2
+    assert data["relations"] == [{"source": "user1", "relationship": "works_in", "target": "上海"}]
     assert "prompt_block" not in data
     assert "usage_hint" not in data
 
@@ -120,6 +125,64 @@ def test_add_memory_rejects_unauthorized_namespace():
     )
 
     assert response.status_code == 403
+
+
+def test_search_memories_route_returns_relations(monkeypatch):
+    async def fake_search_memories_with_relations(**kwargs):
+        return {
+            "items": [{"id": "m1", "text": "用户喜欢 Python", "score": 0.91}],
+            "relations": [{"source": "user1", "relationship": "likes", "target": "Python"}],
+        }
+
+    monkeypatch.setattr(
+        mem0_service,
+        "search_memories_with_relations",
+        fake_search_memories_with_relations,
+        raising=False,
+    )
+
+    client = build_app()
+    response = client.post(
+        "/api/v1/memories/search",
+        headers=auth_headers(),
+        json={
+            "namespace": "team-a",
+            "subject_id": "subject-1",
+            "query": "用户喜欢什么",
+            "limit": 5,
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert data["relations"] == [{"source": "user1", "relationship": "likes", "target": "Python"}]
+
+
+def test_get_all_memories_route_returns_relations(monkeypatch):
+    async def fake_get_all_memories_with_relations(**kwargs):
+        return {
+            "items": [{"id": "m1", "text": "用户在上海工作"}],
+            "relations": [{"source": "user1", "relationship": "works_in", "target": "上海"}],
+        }
+
+    monkeypatch.setattr(
+        mem0_service,
+        "get_all_memories_with_relations",
+        fake_get_all_memories_with_relations,
+        raising=False,
+    )
+
+    client = build_app()
+    response = client.get(
+        "/api/v1/memories/team-a/subject-1",
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert data["relations"] == [{"source": "user1", "relationship": "works_in", "target": "上海"}]
 
 
 def test_subject_context_route_uses_subject_prefix(monkeypatch):
@@ -234,6 +297,20 @@ async def test_mem0_service_add_memory_passes_scope_and_context(monkeypatch):
     assert fake_client.add_calls[0]["run_id"] == "session-1"
     assert tracked == {"namespace": "team-a", "subject_id": "subject-1", "write_count": 1}
     assert result["text"] == "prefers python"
+    assert result["relations"] == []
+
+
+def test_mem0_service_get_config_includes_graph_store_when_neo4j_is_configured(monkeypatch):
+    monkeypatch.setattr(settings, "NEO4J_URL", "bolt://localhost:7687", raising=False)
+    monkeypatch.setattr(settings, "NEO4J_USERNAME", "neo4j", raising=False)
+    monkeypatch.setattr(settings, "NEO4J_PASSWORD", "password", raising=False)
+
+    config = mem0_service._get_config(namespace="team-a", subject_id="subject-1")
+
+    assert config["graph_store"]["provider"] == "neo4j"
+    assert config["graph_store"]["config"]["url"] == "bolt://localhost:7687"
+    assert config["graph_store"]["config"]["username"] == "neo4j"
+    assert config["graph_store"]["config"]["password"] == "password"
 
 
 @pytest.mark.asyncio
@@ -266,42 +343,48 @@ async def test_mem0_service_search_passes_filters(monkeypatch):
 async def test_mem0_service_context_uses_llm_rewritten_query(monkeypatch):
     captured = {}
 
-    async def fake_search_memories(**kwargs):
+    async def fake_search_memories_with_relations(**kwargs):
         captured["query"] = kwargs["query"]
-        return [
-            {
-                "id": "m1",
-                "text": "用户喜欢 Python",
-                "score": 0.95,
-                "metadata": {"category": "preference"},
-                "created_at": "2026-03-06T10:00:00+00:00",
-            },
-            {
-                "id": "m2",
-                "text": "用户在上海工作",
-                "score": 0.88,
-                "metadata": {"category": "profile"},
-                "created_at": "2026-03-05T10:00:00+00:00",
-            },
-        ]
+        return {
+            "items": [
+                {
+                    "id": "m1",
+                    "text": "用户喜欢 Python",
+                    "score": 0.95,
+                    "metadata": {"category": "preference"},
+                    "created_at": "2026-03-06T10:00:00+00:00",
+                },
+                {
+                    "id": "m2",
+                    "text": "用户在上海工作",
+                    "score": 0.88,
+                    "metadata": {"category": "profile"},
+                    "created_at": "2026-03-05T10:00:00+00:00",
+                },
+            ],
+            "relations": [{"source": "user1", "relationship": "works_in", "target": "上海"}],
+        }
 
-    async def fake_get_all_memories(**kwargs):
-        return [
-            {
-                "id": "m2",
-                "text": "用户在上海工作",
-                "score": None,
-                "metadata": {"category": "profile"},
-                "created_at": "2026-03-05T10:00:00+00:00",
-            },
-            {
-                "id": "m3",
-                "text": "最近在评估 LangGraph 方案",
-                "score": None,
-                "metadata": {"category": "recent"},
-                "created_at": "2026-03-06T12:00:00+00:00",
-            },
-        ]
+    async def fake_get_all_memories_with_relations(**kwargs):
+        return {
+            "items": [
+                {
+                    "id": "m2",
+                    "text": "用户在上海工作",
+                    "score": None,
+                    "metadata": {"category": "profile"},
+                    "created_at": "2026-03-05T10:00:00+00:00",
+                },
+                {
+                    "id": "m3",
+                    "text": "最近在评估 LangGraph 方案",
+                    "score": None,
+                    "metadata": {"category": "recent"},
+                    "created_at": "2026-03-06T12:00:00+00:00",
+                },
+            ],
+            "relations": [{"source": "user1", "relationship": "evaluating", "target": "LangGraph"}],
+        }
 
     async def fake_rewrite_query_with_llm(query, history_items):
         captured["rewrite_input"] = {
@@ -310,8 +393,8 @@ async def test_mem0_service_context_uses_llm_rewritten_query(monkeypatch):
         }
         return "用户当前的技术偏好、所在城市和最近关注项目"
 
-    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
-    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "search_memories_with_relations", fake_search_memories_with_relations)
+    monkeypatch.setattr(mem0_service, "get_all_memories_with_relations", fake_get_all_memories_with_relations)
     monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
 
     result = await mem0_service.get_context_for_llm(
@@ -332,6 +415,10 @@ async def test_mem0_service_context_uses_llm_rewritten_query(monkeypatch):
     assert captured["query"] == result["enhanced_query"]
     assert result["history_used"] == ["最近在评估 LangGraph 方案", "用户在上海工作"]
     assert [item["id"] for item in result["sources"]] == ["m1", "m2", "m3"]
+    assert result["relations"] == [
+        {"source": "user1", "relationship": "works_in", "target": "上海"},
+        {"source": "user1", "relationship": "evaluating", "target": "LangGraph"},
+    ]
     assert "prompt_block" not in result
     assert "usage_hint" not in result
     assert "以下是与当前问题最相关的用户记忆" in result["context"]
@@ -342,36 +429,42 @@ async def test_mem0_service_context_uses_llm_rewritten_query(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_mem0_service_context_filters_relevant_memories_by_min_score(monkeypatch):
-    async def fake_search_memories(**kwargs):
-        return [
-            {
-                "id": "m1",
-                "text": "高相关信息",
-                "score": 0.91,
-                "created_at": "2026-03-06T10:00:00+00:00",
-            },
-            {
-                "id": "m2",
-                "text": "低相关信息",
-                "score": 0.42,
-                "created_at": "2026-03-05T10:00:00+00:00",
-            },
-        ]
+    async def fake_search_memories_with_relations(**kwargs):
+        return {
+            "items": [
+                {
+                    "id": "m1",
+                    "text": "高相关信息",
+                    "score": 0.91,
+                    "created_at": "2026-03-06T10:00:00+00:00",
+                },
+                {
+                    "id": "m2",
+                    "text": "低相关信息",
+                    "score": 0.42,
+                    "created_at": "2026-03-05T10:00:00+00:00",
+                },
+            ],
+            "relations": [],
+        }
 
-    async def fake_get_all_memories(**kwargs):
-        return [
-            {
-                "id": "m3",
-                "text": "最近记忆",
-                "created_at": "2026-03-06T12:00:00+00:00",
-            }
-        ]
+    async def fake_get_all_memories_with_relations(**kwargs):
+        return {
+            "items": [
+                {
+                    "id": "m3",
+                    "text": "最近记忆",
+                    "created_at": "2026-03-06T12:00:00+00:00",
+                }
+            ],
+            "relations": [],
+        }
 
     async def fake_rewrite_query_with_llm(query, history_items):
         return "增强后的 query"
 
-    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
-    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "search_memories_with_relations", fake_search_memories_with_relations)
+    monkeypatch.setattr(mem0_service, "get_all_memories_with_relations", fake_get_all_memories_with_relations)
     monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
 
     result = await mem0_service.get_context_for_llm(
@@ -389,42 +482,48 @@ async def test_mem0_service_context_filters_relevant_memories_by_min_score(monke
 
 @pytest.mark.asyncio
 async def test_mem0_service_context_drops_low_score_relevant_results_when_recent_fallback_exists(monkeypatch):
-    async def fake_search_memories(**kwargs):
-        return [
-            {
-                "id": "m1",
-                "text": "最好的低分结果",
-                "score": 0.49,
-                "created_at": "2026-03-06T10:00:00+00:00",
-            },
-            {
-                "id": "m2",
-                "text": "次优低分结果",
-                "score": 0.31,
-                "created_at": "2026-03-05T10:00:00+00:00",
-            },
-            {
-                "id": "m3",
-                "text": "更差的低分结果",
-                "score": 0.12,
-                "created_at": "2026-03-04T10:00:00+00:00",
-            },
-        ]
+    async def fake_search_memories_with_relations(**kwargs):
+        return {
+            "items": [
+                {
+                    "id": "m1",
+                    "text": "最好的低分结果",
+                    "score": 0.49,
+                    "created_at": "2026-03-06T10:00:00+00:00",
+                },
+                {
+                    "id": "m2",
+                    "text": "次优低分结果",
+                    "score": 0.31,
+                    "created_at": "2026-03-05T10:00:00+00:00",
+                },
+                {
+                    "id": "m3",
+                    "text": "更差的低分结果",
+                    "score": 0.12,
+                    "created_at": "2026-03-04T10:00:00+00:00",
+                },
+            ],
+            "relations": [],
+        }
 
-    async def fake_get_all_memories(**kwargs):
-        return [
-            {
-                "id": "m4",
-                "text": "最近补充记忆",
-                "created_at": "2026-03-07T10:00:00+00:00",
-            }
-        ]
+    async def fake_get_all_memories_with_relations(**kwargs):
+        return {
+            "items": [
+                {
+                    "id": "m4",
+                    "text": "最近补充记忆",
+                    "created_at": "2026-03-07T10:00:00+00:00",
+                }
+            ],
+            "relations": [],
+        }
 
     async def fake_rewrite_query_with_llm(query, history_items):
         return "增强后的 query"
 
-    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
-    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "search_memories_with_relations", fake_search_memories_with_relations)
+    monkeypatch.setattr(mem0_service, "get_all_memories_with_relations", fake_get_all_memories_with_relations)
     monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
 
     result = await mem0_service.get_context_for_llm(
@@ -446,24 +545,27 @@ async def test_mem0_service_context_drops_low_score_relevant_results_when_recent
 async def test_mem0_service_context_falls_back_to_original_query_when_rewrite_fails(monkeypatch):
     captured = {}
 
-    async def fake_search_memories(**kwargs):
+    async def fake_search_memories_with_relations(**kwargs):
         captured["query"] = kwargs["query"]
-        return []
+        return {"items": [], "relations": []}
 
-    async def fake_get_all_memories(**kwargs):
-        return [
-            {
-                "id": "m1",
-                "text": "用户喜欢 Python",
-                "created_at": "2026-03-06T10:00:00+00:00",
-            }
-        ]
+    async def fake_get_all_memories_with_relations(**kwargs):
+        return {
+            "items": [
+                {
+                    "id": "m1",
+                    "text": "用户喜欢 Python",
+                    "created_at": "2026-03-06T10:00:00+00:00",
+                }
+            ],
+            "relations": [],
+        }
 
     async def fake_rewrite_query_with_llm(query, history_items):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
-    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "search_memories_with_relations", fake_search_memories_with_relations)
+    monkeypatch.setattr(mem0_service, "get_all_memories_with_relations", fake_get_all_memories_with_relations)
     monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
 
     result = await mem0_service.get_context_for_llm(
@@ -483,24 +585,27 @@ async def test_mem0_service_context_falls_back_to_original_query_when_rewrite_fa
 async def test_mem0_service_context_falls_back_to_original_query_when_rewrite_returns_empty(monkeypatch):
     captured = {}
 
-    async def fake_search_memories(**kwargs):
+    async def fake_search_memories_with_relations(**kwargs):
         captured["query"] = kwargs["query"]
-        return []
+        return {"items": [], "relations": []}
 
-    async def fake_get_all_memories(**kwargs):
-        return [
-            {
-                "id": "m1",
-                "text": "用户最近在调试 JWT 鉴权",
-                "created_at": "2026-03-06T10:00:00+00:00",
-            }
-        ]
+    async def fake_get_all_memories_with_relations(**kwargs):
+        return {
+            "items": [
+                {
+                    "id": "m1",
+                    "text": "用户最近在调试 JWT 鉴权",
+                    "created_at": "2026-03-06T10:00:00+00:00",
+                }
+            ],
+            "relations": [],
+        }
 
     async def fake_rewrite_query_with_llm(query, history_items):
         return "   "
 
-    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
-    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "search_memories_with_relations", fake_search_memories_with_relations)
+    monkeypatch.setattr(mem0_service, "get_all_memories_with_relations", fake_get_all_memories_with_relations)
     monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
 
     result = await mem0_service.get_context_for_llm(
@@ -517,25 +622,28 @@ async def test_mem0_service_context_falls_back_to_original_query_when_rewrite_re
 
 @pytest.mark.asyncio
 async def test_mem0_service_context_without_query_returns_recent_memories_only(monkeypatch):
-    async def fake_search_memories(**kwargs):
-        raise AssertionError("search_memories should not be called when query is empty")
+    async def fake_search_memories_with_relations(**kwargs):
+        raise AssertionError("search_memories_with_relations should not be called when query is empty")
 
     async def fake_rewrite_query_with_llm(query, history_items):
         raise AssertionError("_rewrite_query_with_llm should not be called when query is empty")
 
-    async def fake_get_all_memories(**kwargs):
-        return [
-            {
-                "id": "m3",
-                "text": "最近在评估 LangGraph 方案",
-                "score": None,
-                "metadata": {"category": "recent"},
-                "created_at": "2026-03-06T12:00:00+00:00",
-            }
-        ]
+    async def fake_get_all_memories_with_relations(**kwargs):
+        return {
+            "items": [
+                {
+                    "id": "m3",
+                    "text": "最近在评估 LangGraph 方案",
+                    "score": None,
+                    "metadata": {"category": "recent"},
+                    "created_at": "2026-03-06T12:00:00+00:00",
+                }
+            ],
+            "relations": [],
+        }
 
-    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
-    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "search_memories_with_relations", fake_search_memories_with_relations)
+    monkeypatch.setattr(mem0_service, "get_all_memories_with_relations", fake_get_all_memories_with_relations)
     monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
 
     result = await mem0_service.get_context_for_llm(

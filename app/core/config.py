@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     # Mem0 Configuration
     MEM0_API_KEY: str = ""
     MEM0_SEARCH_MSG_LIMIT: int = 5
+    NEO4J_URL: str = ""
+    NEO4J_USERNAME: str = ""
+    NEO4J_PASSWORD: str = ""
+    MEM0_GRAPH_CUSTOM_PROMPT: str = ""
 
     # Security
     SECRET_KEY: str

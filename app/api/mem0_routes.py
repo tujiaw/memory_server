@@ -81,7 +81,7 @@ async def search_memories(
     """Search memories by namespace, subject, and optional run."""
     try:
         authorize_namespace(auth_context, request.namespace)
-        results = await mem0_service.search_memories(
+        result = await mem0_service.search_memories_with_relations(
             namespace=request.namespace,
             subject_id=request.subject_id,
             query=request.query,
@@ -89,7 +89,12 @@ async def search_memories(
             run_id=request.run_id,
             filters=request.filters,
         )
-        return MemoryListResponse(success=True, data=results, count=len(results))
+        return MemoryListResponse(
+            success=True,
+            data=result["items"],
+            count=len(result["items"]),
+            relations=result["relations"],
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -110,13 +115,18 @@ async def get_all_memories(
     """Get all memories for a subject."""
     try:
         authorize_namespace(auth_context, namespace)
-        results = await mem0_service.get_all_memories(
+        result = await mem0_service.get_all_memories_with_relations(
             namespace=namespace,
             subject_id=subject_id,
             limit=limit,
             run_id=run_id,
         )
-        return MemoryListResponse(success=True, data=results, count=len(results))
+        return MemoryListResponse(
+            success=True,
+            data=result["items"],
+            count=len(result["items"]),
+            relations=result["relations"],
+        )
     except HTTPException:
         raise
     except Exception as e:
