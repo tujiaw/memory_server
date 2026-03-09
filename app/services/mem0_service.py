@@ -2,6 +2,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from mem0 import Memory
+from openai import AsyncOpenAI
 
 from app.core.config import settings
 from app.services.user_service import user_service
@@ -12,6 +13,7 @@ class Mem0Service:
 
     def __init__(self):
         self._memories: Dict[str, Memory] = {}
+        self._openai_client: Optional[AsyncOpenAI] = None
 
     @staticmethod
     def _scope_key(namespace: str, subject_id: str) -> str:
@@ -165,15 +167,140 @@ class Mem0Service:
         return sorted(items, key=sort_key, reverse=True)
 
     @staticmethod
-    def _build_context_text(query: Optional[str], items: List[Dict[str, Any]]) -> str:
-        if not items:
-            return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
+    def _memory_dedupe_key(item: Dict[str, Any]) -> tuple:
+        return (item.get("id"), (item.get("text") or "").strip())
 
-        title = "以下是与当前问题最相关的用户记忆：" if query and query.strip() else "以下是该用户的可用记忆："
+    def _merge_context_sources(
+        self,
+        relevant_memories: List[Dict[str, Any]],
+        recent_memories: List[Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        deduplicated_relevant = self._deduplicate_memory_items(relevant_memories)
+        deduplicated_recent = self._deduplicate_memory_items(recent_memories)
+        relevant_keys = {
+            self._memory_dedupe_key(item)
+            for item in deduplicated_relevant
+        }
+        recent_only = [
+            item
+            for item in deduplicated_recent
+            if self._memory_dedupe_key(item) not in relevant_keys
+        ]
+        return {
+            "relevant": deduplicated_relevant,
+            "recent": recent_only,
+        }
+
+    @staticmethod
+    def _filter_relevant_memories_by_score(
+        relevant_memories: List[Dict[str, Any]],
+        min_score: float,
+        fallback_count: int = 0,
+    ) -> List[Dict[str, Any]]:
+        deduplicated_relevant = Mem0Service._deduplicate_memory_items(relevant_memories)
+        filtered_items = [
+            item
+            for item in deduplicated_relevant
+            if (item.get("score") or 0) >= min_score
+        ]
+        if filtered_items:
+            return filtered_items
+        return deduplicated_relevant[:fallback_count]
+
+    @staticmethod
+    def _build_memory_section(title: str, items: List[Dict[str, Any]]) -> Optional[str]:
         lines = [f"{index + 1}. {item['text']}" for index, item in enumerate(items) if item.get("text")]
         if not lines:
-            return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
+            return None
         return title + "\n\n" + "\n".join(lines)
+
+    def _build_context_text(
+        self,
+        query: Optional[str],
+        relevant_items: List[Dict[str, Any]],
+        recent_items: List[Dict[str, Any]],
+    ) -> str:
+        all_items = relevant_items + recent_items
+        if not all_items:
+            return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
+
+        if not query or not query.strip():
+            recent_section = self._build_memory_section("以下是该用户的可用记忆：", recent_items)
+            if recent_section:
+                return recent_section
+            return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
+
+        sections: List[str] = []
+        relevant_section = self._build_memory_section("以下是与当前问题最相关的用户记忆：", relevant_items)
+        if relevant_section:
+            sections.append(relevant_section)
+
+        recent_section = self._build_memory_section("以下是最近记忆补充：", recent_items)
+        if recent_section:
+            sections.append(recent_section)
+
+        if not sections:
+            return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _select_history_for_query_enhancement(
+        recent_memories: List[Dict[str, Any]],
+        max_items: int = 3,
+    ) -> List[str]:
+        history_items: List[str] = []
+
+        for item in recent_memories:
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue
+
+            history_items.append(text)
+            if len(history_items) >= max_items:
+                break
+
+        return history_items
+
+    def _get_openai_client(self) -> AsyncOpenAI:
+        if self._openai_client is None:
+            self._openai_client = AsyncOpenAI(
+                api_key=settings.OPENAI_API_KEY,
+                base_url=settings.OPENAI_API_BASE,
+            )
+        return self._openai_client
+
+    @staticmethod
+    def _build_query_rewrite_prompt(query: str, history_items: List[str]) -> str:
+        history_block = "\n".join(f"- {item}" for item in history_items)
+        return (
+            "你是一个检索查询改写助手。"
+            "请结合用户原始 query 和最近历史，生成一个更适合 memory 检索的增强 query。"
+            "只返回一行增强后的 query，不要解释，不要返回 JSON。\n\n"
+            f"原始 query:\n{query}\n\n"
+            f"最近历史:\n{history_block}"
+        )
+
+    async def _rewrite_query_with_llm(self, query: str, history_items: List[str]) -> str:
+        if not history_items:
+            return query.strip()
+
+        client = self._get_openai_client()
+        response = await client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你负责把用户问题改写成更适合语义检索的简洁查询。",
+                },
+                {
+                    "role": "user",
+                    "content": self._build_query_rewrite_prompt(query.strip(), history_items),
+                },
+            ],
+        )
+        message = response.choices[0].message.content if response.choices else None
+        return (message or "").strip()
 
     # ========================================================================
     # Basic Memory Operations
@@ -256,18 +383,14 @@ class Mem0Service:
         subject_id: str,
         query: Optional[str] = None,
         limit: int = 15,
+        min_score: float = 0.5,
         run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """获取适合直接注入 LLM 的 RAG 风格上下文。"""
+        normalized_query = query.strip() if query and query.strip() else None
+        enhanced_query: Optional[str] = None
+        history_used: List[str] = []
         task_relevant_memories: List[Dict[str, Any]] = []
-        if query and query.strip():
-            task_relevant_memories = await self.search_memories(
-                namespace=namespace,
-                subject_id=subject_id,
-                query=query.strip(),
-                limit=limit,
-                run_id=run_id,
-            )
 
         recent_memories = await self.get_all_memories(
             namespace=namespace,
@@ -277,10 +400,41 @@ class Mem0Service:
         )
         recent_memories = self._sort_memories_by_recency(self._deduplicate_memory_items(recent_memories))
 
-        merged_items = self._deduplicate_memory_items(task_relevant_memories + recent_memories)
+        if normalized_query:
+            candidate_history = self._select_history_for_query_enhancement(recent_memories)
+            try:
+                rewritten_query = await self._rewrite_query_with_llm(normalized_query, candidate_history)
+                enhanced_query = rewritten_query.strip() or normalized_query
+                if enhanced_query != normalized_query:
+                    history_used = candidate_history
+            except Exception:
+                enhanced_query = normalized_query
+                history_used = []
+
+            task_relevant_memories = await self.search_memories(
+                namespace=namespace,
+                subject_id=subject_id,
+                query=enhanced_query,
+                limit=limit,
+                run_id=run_id,
+            )
+            task_relevant_memories = self._filter_relevant_memories_by_score(
+                task_relevant_memories,
+                min_score=min_score,
+            )
+
+        grouped_sources = self._merge_context_sources(task_relevant_memories, recent_memories)
+        merged_items = grouped_sources["relevant"] + grouped_sources["recent"]
         result: Dict[str, Any] = {
-            "context": self._build_context_text(query=query, items=merged_items),
+            "context": self._build_context_text(
+                query=normalized_query,
+                relevant_items=grouped_sources["relevant"],
+                recent_items=grouped_sources["recent"],
+            ),
             "count": len(merged_items),
+            "query": normalized_query,
+            "enhanced_query": enhanced_query,
+            "history_used": history_used,
             "sources": merged_items,
         }
         return result

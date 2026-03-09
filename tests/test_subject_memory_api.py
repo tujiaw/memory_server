@@ -64,10 +64,16 @@ def test_add_memory_uses_subject_scope(monkeypatch):
 
 
 def test_memory_context_returns_llm_ready_string(monkeypatch):
+    captured = {}
+
     async def fake_get_context_for_llm(**kwargs):
+        captured.update(kwargs)
         return {
             "context": "以下是关于该用户的关键记忆：\n\n1. 用户喜欢 Python\n2. 用户在上海工作",
             "count": 2,
+            "query": "用户偏好",
+            "enhanced_query": "用户的技术偏好和工作背景",
+            "history_used": ["用户喜欢 Python"],
             "sources": [
                 {"id": "m1", "text": "用户喜欢 Python", "score": 0.9},
                 {"id": "m2", "text": "用户在上海工作", "score": 0.85},
@@ -92,6 +98,10 @@ def test_memory_context_returns_llm_ready_string(monkeypatch):
     data = response.json()
     assert "以下是关于该用户的关键记忆" in data["context"]
     assert data["count"] == 2
+    assert data["query"] == "用户偏好"
+    assert data["enhanced_query"] == "用户的技术偏好和工作背景"
+    assert data["history_used"] == ["用户喜欢 Python"]
+    assert captured["min_score"] == 0.5
     assert len(data["sources"]) == 2
     assert "prompt_block" not in data
     assert "usage_hint" not in data
@@ -253,8 +263,11 @@ async def test_mem0_service_search_passes_filters(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_mem0_service_context_v2_deduplicates_and_builds_sections(monkeypatch):
+async def test_mem0_service_context_uses_llm_rewritten_query(monkeypatch):
+    captured = {}
+
     async def fake_search_memories(**kwargs):
+        captured["query"] = kwargs["query"]
         return [
             {
                 "id": "m1",
@@ -290,8 +303,16 @@ async def test_mem0_service_context_v2_deduplicates_and_builds_sections(monkeypa
             },
         ]
 
+    async def fake_rewrite_query_with_llm(query, history_items):
+        captured["rewrite_input"] = {
+            "query": query,
+            "history_items": history_items,
+        }
+        return "用户当前的技术偏好、所在城市和最近关注项目"
+
     monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
     monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
 
     result = await mem0_service.get_context_for_llm(
         namespace="team-a",
@@ -302,7 +323,230 @@ async def test_mem0_service_context_v2_deduplicates_and_builds_sections(monkeypa
 
     assert "以下是与当前问题最相关的用户记忆" in result["context"]
     assert len(result["sources"]) == 3
+    assert result["query"] == "用户背景和最近在做什么"
+    assert captured["rewrite_input"] == {
+        "query": "用户背景和最近在做什么",
+        "history_items": ["最近在评估 LangGraph 方案", "用户在上海工作"],
+    }
+    assert result["enhanced_query"] == "用户当前的技术偏好、所在城市和最近关注项目"
+    assert captured["query"] == result["enhanced_query"]
+    assert result["history_used"] == ["最近在评估 LangGraph 方案", "用户在上海工作"]
+    assert [item["id"] for item in result["sources"]] == ["m1", "m2", "m3"]
     assert "prompt_block" not in result
     assert "usage_hint" not in result
+    assert "以下是与当前问题最相关的用户记忆" in result["context"]
+    assert "以下是最近记忆补充" in result["context"]
     assert "用户喜欢 Python" in result["context"]
     assert "最近在评估 LangGraph 方案" in result["context"]
+
+
+@pytest.mark.asyncio
+async def test_mem0_service_context_filters_relevant_memories_by_min_score(monkeypatch):
+    async def fake_search_memories(**kwargs):
+        return [
+            {
+                "id": "m1",
+                "text": "高相关信息",
+                "score": 0.91,
+                "created_at": "2026-03-06T10:00:00+00:00",
+            },
+            {
+                "id": "m2",
+                "text": "低相关信息",
+                "score": 0.42,
+                "created_at": "2026-03-05T10:00:00+00:00",
+            },
+        ]
+
+    async def fake_get_all_memories(**kwargs):
+        return [
+            {
+                "id": "m3",
+                "text": "最近记忆",
+                "created_at": "2026-03-06T12:00:00+00:00",
+            }
+        ]
+
+    async def fake_rewrite_query_with_llm(query, history_items):
+        return "增强后的 query"
+
+    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
+    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
+
+    result = await mem0_service.get_context_for_llm(
+        namespace="team-a",
+        subject_id="subject-1",
+        query="查询",
+        limit=10,
+        min_score=0.5,
+    )
+
+    assert [item["id"] for item in result["sources"]] == ["m1", "m3"]
+    assert "低相关信息" not in result["context"]
+    assert "高相关信息" in result["context"]
+
+
+@pytest.mark.asyncio
+async def test_mem0_service_context_drops_low_score_relevant_results_when_recent_fallback_exists(monkeypatch):
+    async def fake_search_memories(**kwargs):
+        return [
+            {
+                "id": "m1",
+                "text": "最好的低分结果",
+                "score": 0.49,
+                "created_at": "2026-03-06T10:00:00+00:00",
+            },
+            {
+                "id": "m2",
+                "text": "次优低分结果",
+                "score": 0.31,
+                "created_at": "2026-03-05T10:00:00+00:00",
+            },
+            {
+                "id": "m3",
+                "text": "更差的低分结果",
+                "score": 0.12,
+                "created_at": "2026-03-04T10:00:00+00:00",
+            },
+        ]
+
+    async def fake_get_all_memories(**kwargs):
+        return [
+            {
+                "id": "m4",
+                "text": "最近补充记忆",
+                "created_at": "2026-03-07T10:00:00+00:00",
+            }
+        ]
+
+    async def fake_rewrite_query_with_llm(query, history_items):
+        return "增强后的 query"
+
+    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
+    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
+
+    result = await mem0_service.get_context_for_llm(
+        namespace="team-a",
+        subject_id="subject-1",
+        query="查询",
+        limit=10,
+        min_score=0.5,
+    )
+
+    assert [item["id"] for item in result["sources"]] == ["m4"]
+    assert "最好的低分结果" not in result["context"]
+    assert "次优低分结果" not in result["context"]
+    assert "更差的低分结果" not in result["context"]
+    assert "最近补充记忆" in result["context"]
+
+
+@pytest.mark.asyncio
+async def test_mem0_service_context_falls_back_to_original_query_when_rewrite_fails(monkeypatch):
+    captured = {}
+
+    async def fake_search_memories(**kwargs):
+        captured["query"] = kwargs["query"]
+        return []
+
+    async def fake_get_all_memories(**kwargs):
+        return [
+            {
+                "id": "m1",
+                "text": "用户喜欢 Python",
+                "created_at": "2026-03-06T10:00:00+00:00",
+            }
+        ]
+
+    async def fake_rewrite_query_with_llm(query, history_items):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
+    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
+
+    result = await mem0_service.get_context_for_llm(
+        namespace="team-a",
+        subject_id="subject-1",
+        query=" 用户喜欢什么语言 ",
+        limit=5,
+    )
+
+    assert captured["query"] == "用户喜欢什么语言"
+    assert result["query"] == "用户喜欢什么语言"
+    assert result["enhanced_query"] == "用户喜欢什么语言"
+    assert result["history_used"] == []
+
+
+@pytest.mark.asyncio
+async def test_mem0_service_context_falls_back_to_original_query_when_rewrite_returns_empty(monkeypatch):
+    captured = {}
+
+    async def fake_search_memories(**kwargs):
+        captured["query"] = kwargs["query"]
+        return []
+
+    async def fake_get_all_memories(**kwargs):
+        return [
+            {
+                "id": "m1",
+                "text": "用户最近在调试 JWT 鉴权",
+                "created_at": "2026-03-06T10:00:00+00:00",
+            }
+        ]
+
+    async def fake_rewrite_query_with_llm(query, history_items):
+        return "   "
+
+    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
+    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
+
+    result = await mem0_service.get_context_for_llm(
+        namespace="team-a",
+        subject_id="subject-1",
+        query="最近在做什么",
+        limit=5,
+    )
+
+    assert captured["query"] == "最近在做什么"
+    assert result["enhanced_query"] == "最近在做什么"
+    assert result["history_used"] == []
+
+
+@pytest.mark.asyncio
+async def test_mem0_service_context_without_query_returns_recent_memories_only(monkeypatch):
+    async def fake_search_memories(**kwargs):
+        raise AssertionError("search_memories should not be called when query is empty")
+
+    async def fake_rewrite_query_with_llm(query, history_items):
+        raise AssertionError("_rewrite_query_with_llm should not be called when query is empty")
+
+    async def fake_get_all_memories(**kwargs):
+        return [
+            {
+                "id": "m3",
+                "text": "最近在评估 LangGraph 方案",
+                "score": None,
+                "metadata": {"category": "recent"},
+                "created_at": "2026-03-06T12:00:00+00:00",
+            }
+        ]
+
+    monkeypatch.setattr(mem0_service, "search_memories", fake_search_memories)
+    monkeypatch.setattr(mem0_service, "get_all_memories", fake_get_all_memories)
+    monkeypatch.setattr(mem0_service, "_rewrite_query_with_llm", fake_rewrite_query_with_llm, raising=False)
+
+    result = await mem0_service.get_context_for_llm(
+        namespace="team-a",
+        subject_id="subject-1",
+        query="  ",
+        limit=10,
+    )
+
+    assert "以下是该用户的可用记忆" in result["context"]
+    assert result["query"] is None
+    assert result["enhanced_query"] is None
+    assert result["history_used"] == []
+    assert result["count"] == 1

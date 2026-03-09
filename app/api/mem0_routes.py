@@ -52,7 +52,7 @@ async def get_memory_context(
     request: MemoryContextRequest,
     auth_context: Annotated[AuthContext, Depends(get_auth_context)],
 ):
-    """获取可直接注入大模型的记忆上下文。有 query 时语义检索，无 query 时取最近记忆。"""
+    """获取可直接注入大模型的记忆上下文。有 query 时先用 LLM 结合最近历史改写再检索，无 query 时取最近记忆。"""
     try:
         authorize_namespace(auth_context, request.namespace)
         result = await mem0_service.get_context_for_llm(
@@ -60,6 +60,7 @@ async def get_memory_context(
             subject_id=request.subject_id,
             query=request.query,
             limit=request.limit,
+            min_score=request.min_score,
             run_id=request.run_id,
         )
         return MemoryContextResponse(**result)
