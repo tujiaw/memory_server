@@ -1,15 +1,18 @@
+import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from app.database.mongodb import get_subject_collection
+from app.database import postgres as pg_database
+from app.database.sql import (
+    SUBJECT_INCREMENT_MEMORY,
+    SUBJECT_SELECT,
+    SUBJECT_UPSERT_CONTEXT,
+    SUBJECT_UPSERT_TOUCH,
+)
 
 
 class UserService:
-    """Service for managing subject context in MongoDB."""
-
-    @staticmethod
-    def _subject_key(namespace: str, subject_id: str) -> str:
-        return f"{namespace}:{subject_id}"
+    """Subject context and activity in PostgreSQL."""
 
     async def upsert_subject_context(
         self,
@@ -21,97 +24,46 @@ class UserService:
         preferences: Optional[Dict[str, Any]] = None,
         custom_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        collection = await get_subject_collection()
+        if pg_database.postgres_db.pool is None:
+            raise RuntimeError("PostgreSQL is not initialized")
         now = datetime.now(timezone.utc)
-
-        update_data = {
-            "namespace": namespace,
-            "subject_id": subject_id,
-            "updated_at": now,
-        }
-        if name is not None:
-            update_data["name"] = name
-        if email is not None:
-            update_data["email"] = email
-        if role is not None:
-            update_data["role"] = role
-        if preferences is not None:
-            update_data["preferences"] = preferences
-        if custom_data is not None:
-            update_data["custom_data"] = custom_data
-
-        await collection.update_one(
-            {"_id": self._subject_key(namespace, subject_id)},
-            {
-                "$set": update_data,
-                "$setOnInsert": {
-                    "created_at": now,
-                    "last_active": now,
-                    "memory_count": 0,
-                },
-            },
-            upsert=True,
+        await pg_database.postgres_db.execute(
+            SUBJECT_UPSERT_CONTEXT,
+            namespace,
+            subject_id,
+            name,
+            email,
+            role,
+            json.dumps(preferences or {}),
+            json.dumps(custom_data or {}),
+            now,
         )
-
-        return await self.get_subject_context(namespace, subject_id)
+        return await self.get_subject_context(namespace, subject_id) or {}
 
     async def get_subject_context(self, namespace: str, subject_id: str) -> Optional[Dict[str, Any]]:
-        collection = await get_subject_collection()
-        document = await collection.find_one({"_id": self._subject_key(namespace, subject_id)})
-
-        if document is None:
+        if pg_database.postgres_db.pool is None:
             return None
-
-        return self._serialize_subject(document)
+        row = await pg_database.postgres_db.fetchrow(SUBJECT_SELECT, namespace, subject_id)
+        if row is None:
+            return None
+        return self._row_to_subject(row)
 
     async def touch_subject(self, namespace: str, subject_id: str) -> None:
-        collection = await get_subject_collection()
-        await collection.update_one(
-            {"_id": self._subject_key(namespace, subject_id)},
-            {
-                "$set": {
-                    "namespace": namespace,
-                    "subject_id": subject_id,
-                    "last_active": datetime.now(timezone.utc),
-                },
-                "$setOnInsert": {
-                    "created_at": datetime.now(timezone.utc),
-                    "updated_at": datetime.now(timezone.utc),
-                    "memory_count": 0,
-                    "preferences": {},
-                    "custom_data": {},
-                },
-            },
-            upsert=True,
-        )
+        if pg_database.postgres_db.pool is None:
+            return
+        now = datetime.now(timezone.utc)
+        await pg_database.postgres_db.execute(SUBJECT_UPSERT_TOUCH, namespace, subject_id, now)
 
     async def increment_memory_count(self, namespace: str, subject_id: str, amount: int = 1) -> None:
-        collection = await get_subject_collection()
+        if pg_database.postgres_db.pool is None:
+            return
         now = datetime.now(timezone.utc)
-        await collection.update_one(
-            {"_id": self._subject_key(namespace, subject_id)},
-            {
-                "$set": {
-                    "namespace": namespace,
-                    "subject_id": subject_id,
-                    "last_active": now,
-                    "updated_at": now,
-                },
-                "$setOnInsert": {
-                    "created_at": now,
-                    "preferences": {},
-                    "custom_data": {},
-                },
-                "$inc": {"memory_count": amount},
-            },
-            upsert=True,
-        )
+        await pg_database.postgres_db.execute(SUBJECT_INCREMENT_MEMORY, namespace, subject_id, now, amount)
 
     async def get_subject_stats(self, namespace: str, subject_id: str) -> Optional[Dict[str, Any]]:
         context = await self.get_subject_context(namespace, subject_id)
         if context is None:
             return None
-
         return {
             "namespace": namespace,
             "subject_id": subject_id,
@@ -123,21 +75,34 @@ class UserService:
         }
 
     @staticmethod
-    def _serialize_subject(document: Dict[str, Any]) -> Dict[str, Any]:
+    def _row_to_subject(row: Any) -> Dict[str, Any]:
+        prefs = row["preferences"]
+        if isinstance(prefs, str):
+            prefs = json.loads(prefs)
+        custom = row["custom_data"]
+        if isinstance(custom, str):
+            custom = json.loads(custom)
+
+        def iso(v: Any) -> Optional[str]:
+            if v is None:
+                return None
+            if isinstance(v, datetime):
+                return v.isoformat()
+            return str(v)
+
         return {
-            "namespace": document["namespace"],
-            "subject_id": document["subject_id"],
-            "name": document.get("name"),
-            "email": document.get("email"),
-            "role": document.get("role"),
-            "preferences": document.get("preferences", {}),
-            "custom_data": document.get("custom_data", {}),
-            "created_at": document.get("created_at").isoformat() if document.get("created_at") else None,
-            "updated_at": document.get("updated_at").isoformat() if document.get("updated_at") else None,
-            "last_active": document.get("last_active").isoformat() if document.get("last_active") else None,
-            "memory_count": document.get("memory_count", 0),
+            "namespace": row["namespace"],
+            "subject_id": row["subject_id"],
+            "name": row["name"],
+            "email": row["email"],
+            "role": row["role"],
+            "preferences": prefs or {},
+            "custom_data": custom or {},
+            "created_at": iso(row["created_at"]),
+            "updated_at": iso(row["updated_at"]),
+            "last_active": iso(row["last_active"]),
+            "memory_count": row["memory_count"] or 0,
         }
 
 
-# Global instance
 user_service = UserService()

@@ -29,6 +29,9 @@ ENV/
 # Qdrant data
 qdrant_data/
 
+# Docker bind-mount 持久化（docker-compose DATA_DIR）
+data/
+
 # Logs
 *.log
 logs/

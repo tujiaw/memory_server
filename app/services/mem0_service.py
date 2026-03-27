@@ -1,16 +1,14 @@
-import re
-import logging
+import json
 import asyncio
-from time import perf_counter
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from mem0 import Memory
-from openai import AsyncOpenAI
 
 from app.core.config import settings
+from app.database import postgres as pg_database
+from app.database.sql import MEMORY_LEXICAL_DELETE, MEMORY_LEXICAL_UPDATE, MEMORY_LEXICAL_UPSERT
 from app.services.user_service import user_service
-
-logger = logging.getLogger(__name__)
 
 
 class Mem0Service:
@@ -18,17 +16,15 @@ class Mem0Service:
 
     def __init__(self):
         self._memory_client: Optional[Memory] = None
-        self._vector_only_memory_client: Optional[Memory] = None
-        self._openai_client: Optional[AsyncOpenAI] = None
 
     @staticmethod
     def _get_global_config() -> dict:
-        """Generate a global mem0 configuration using a single collection."""
-        config = {
+        """单集合向量库 + LLM；不包含 graph_store，知识图谱检索保持关闭。"""
+        return {
             "vector_store": {
                 "provider": "qdrant",
                 "config": {
-                    "collection_name": "mem0_global_memory",  # 关键改变：全局唯一的集合名称
+                    "collection_name": settings.QDRANT_MEM0_COLLECTION,
                     "host": settings.QDRANT_HOST,
                     "port": settings.QDRANT_PORT,
                     "embedding_model_dims": settings.VECTOR_SIZE,
@@ -50,33 +46,14 @@ class Mem0Service:
             },
             "version": "v1.1",
         }
-        if settings.NEO4J_URL and settings.NEO4J_USERNAME and settings.NEO4J_PASSWORD:
-            config["graph_store"] = {
-                "provider": "neo4j",
-                "config": {
-                    "url": settings.NEO4J_URL,
-                    "username": settings.NEO4J_USERNAME,
-                    "password": settings.NEO4J_PASSWORD,
-                },
-            }
-            if settings.MEM0_GRAPH_CUSTOM_PROMPT:
-                config["graph_store"]["custom_prompt"] = settings.MEM0_GRAPH_CUSTOM_PROMPT
-        return config
 
     def _get_memory_client(self) -> Memory:
         """Get or create the global Memory client."""
         if self._memory_client is None:
-            config = self._get_global_config()
-            self._memory_client = Memory.from_config(config)
+            client = Memory.from_config(self._get_global_config())
+            client.enable_graph = False
+            self._memory_client = client
         return self._memory_client
-
-    def _get_vector_only_memory_client(self) -> Memory:
-        """Get or create the global vector-only Memory client (without graph store)."""
-        if self._vector_only_memory_client is None:
-            config = dict(self._get_global_config())
-            config.pop("graph_store", None)
-            self._vector_only_memory_client = Memory.from_config(config)
-        return self._vector_only_memory_client
 
     async def _get_subject_context(self, namespace: str, subject_id: str) -> Dict[str, Any]:
         subject = await user_service.get_subject_context(namespace, subject_id)
@@ -137,7 +114,7 @@ class Mem0Service:
     @staticmethod
     def _normalize_memory_result(result: Dict[str, Any]) -> Dict[str, Any]:
         metadata = result.get("metadata")
-        return {
+        out: Dict[str, Any] = {
             "id": result.get("id"),
             "text": result.get("memory") or result.get("text", ""),
             "metadata": metadata,
@@ -148,6 +125,9 @@ class Mem0Service:
             "created_at": result.get("created_at"),
             "updated_at": result.get("updated_at"),
         }
+        if result.get("match_sources") is not None:
+            out["match_sources"] = result["match_sources"]
+        return out
 
     def _normalize_results(self, payload: Any) -> List[Dict[str, Any]]:
         if isinstance(payload, dict):
@@ -157,51 +137,47 @@ class Mem0Service:
         return [self._normalize_memory_result(result) for result in results]
 
     @staticmethod
-    def _normalize_relation_item(result: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "source": result.get("source"),
-            "relationship": result.get("relationship") or result.get("relatationship"),
-            "target": result.get("target") or result.get("destination"),
-        }
+    def _normalize_scores(items: List[Dict[str, Any]], score_key: str = "score") -> List[Dict[str, Any]]:
+        if not items:
+            return items
+        scores = [item.get(score_key) or 0 for item in items]
+        lo, hi = min(scores), max(scores)
+        if hi <= lo:
+            return items
+        return [
+            {**item, "_norm_score": ((item.get(score_key) or 0) - lo) / (hi - lo)}
+            for item in items
+        ]
 
     @staticmethod
-    def _extract_relation_candidates(relations_payload: Any) -> List[Dict[str, Any]]:
-        if isinstance(relations_payload, list):
-            return [item for item in relations_payload if isinstance(item, dict)]
-
-        if not isinstance(relations_payload, dict):
-            return []
-
-        # mem0 add() graph output shape:
-        # {"deleted_entities": [...], "added_entities": [[{...}], ...]}
-        candidates: List[Dict[str, Any]] = []
-        added_entities = relations_payload.get("added_entities", [])
-        for entity_group in added_entities:
-            if isinstance(entity_group, list):
-                candidates.extend(item for item in entity_group if isinstance(item, dict))
-            elif isinstance(entity_group, dict):
-                candidates.append(entity_group)
-        return candidates
-
-    def _normalize_relations(self, payload: Any) -> List[Dict[str, Any]]:
-        if not isinstance(payload, dict):
-            return []
-
-        relations = self._extract_relation_candidates(payload.get("relations", []))
-        normalized_relations: List[Dict[str, Any]] = []
-        seen_keys = set()
-        for relation in relations:
-            normalized_relation = self._normalize_relation_item(relation)
-            dedupe_key = (
-                normalized_relation.get("source"),
-                normalized_relation.get("relationship"),
-                normalized_relation.get("target"),
-            )
-            if dedupe_key in seen_keys:
-                continue
-            seen_keys.add(dedupe_key)
-            normalized_relations.append(normalized_relation)
-        return normalized_relations
+    def _merge_hybrid_results(
+        vector_items: List[Dict[str, Any]],
+        bm25_items: List[Dict[str, Any]],
+        vector_weight: float = 0.7,
+        bm25_weight: float = 0.3,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        vector_norm = Mem0Service._normalize_scores(vector_items)
+        bm25_norm = Mem0Service._normalize_scores(bm25_items)
+        id_to_vector = {item.get("id"): item for item in vector_norm}
+        id_to_bm25 = {item.get("id"): item for item in bm25_norm}
+        all_ids = set(id_to_vector) | set(id_to_bm25)
+        merged: List[Dict[str, Any]] = []
+        for mid in all_ids:
+            v_item = id_to_vector.get(mid)
+            b_item = id_to_bm25.get(mid)
+            v_score = v_item.get("_norm_score", 0) if v_item else 0
+            b_score = b_item.get("_norm_score", 0) if b_item else 0
+            hybrid_score = vector_weight * v_score + bm25_weight * b_score
+            base = v_item or b_item or {}
+            match_sources: List[str] = []
+            if v_item:
+                match_sources.append("vector")
+            if b_item:
+                match_sources.append("bm25")
+            merged.append({**base, "score": hybrid_score, "match_sources": match_sources})
+        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return [Mem0Service._normalize_memory_result({**m, "score": m.get("score")}) for m in merged[:limit]]
 
     @staticmethod
     def _deduplicate_memory_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -222,189 +198,125 @@ class Mem0Service:
 
         return deduplicated
 
-    @staticmethod
-    def _sort_memories_by_recency(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        def sort_key(item: Dict[str, Any]) -> str:
-            return str(item.get("updated_at") or item.get("created_at") or "")
-
-        return sorted(items, key=sort_key, reverse=True)
-
-    @staticmethod
-    def _memory_dedupe_key(item: Dict[str, Any]) -> tuple:
-        return (item.get("id"), (item.get("text") or "").strip())
-
-    def _merge_context_sources(
+    async def _persist_memory_lexical_batch(
         self,
-        relevant_memories: List[Dict[str, Any]],
-        recent_memories: List[Dict[str, Any]],
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        deduplicated_relevant = self._deduplicate_memory_items(relevant_memories)
-        deduplicated_recent = self._deduplicate_memory_items(recent_memories)
-        relevant_keys = {
-            self._memory_dedupe_key(item)
-            for item in deduplicated_relevant
-        }
-        recent_only = [
-            item
-            for item in deduplicated_recent
-            if self._memory_dedupe_key(item) not in relevant_keys
-        ]
-        return {
-            "relevant": deduplicated_relevant,
-            "recent": recent_only,
-        }
-
-    @staticmethod
-    def _filter_relevant_memories_by_score(
-        relevant_memories: List[Dict[str, Any]],
-        min_score: float,
-        fallback_count: int = 0,
-    ) -> List[Dict[str, Any]]:
-        deduplicated_relevant = Mem0Service._deduplicate_memory_items(relevant_memories)
-        filtered_items = [
-            item
-            for item in deduplicated_relevant
-            if (item.get("score") or 0) >= min_score
-        ]
-        if filtered_items:
-            return filtered_items
-        return deduplicated_relevant[:fallback_count]
-
-    @staticmethod
-    def _build_memory_section(title: str, items: List[Dict[str, Any]]) -> Optional[str]:
-        lines = [f"{index + 1}. {item['text']}" for index, item in enumerate(items) if item.get("text")]
-        if not lines:
-            return None
-        return title + "\n\n" + "\n".join(lines)
-
-    @staticmethod
-    def _build_relations_section(relations: List[Dict[str, Any]]) -> Optional[str]:
-        lines: List[str] = []
-        for index, relation in enumerate(relations):
-            source = relation.get("source")
-            relationship = relation.get("relationship")
-            target = relation.get("target")
-            if not source or not relationship or not target:
+        namespace: str,
+        subject_id: str,
+        run_id: Optional[str],
+        items: List[Dict[str, Any]],
+    ) -> None:
+        if pg_database.postgres_db.pool is None:
+            return
+        now = datetime.now(timezone.utc)
+        for item in items:
+            mid = item.get("id")
+            if mid is None:
                 continue
-            lines.append(f"{index + 1}. {source} --{relationship}--> {target}")
-        if not lines:
-            return None
-        return "以下是可用于推理的关系图谱（三元组）：\n\n" + "\n".join(lines)
-
-    @staticmethod
-    def _build_context_usage_guideline() -> str:
-        return (
-            "回答规则：\n"
-            "1. 优先使用关系图谱中的结构化事实。\n"
-            "2. 若与记忆文本存在冲突，优先采用更近期、更具体的信息。\n"
-            "3. 若证据不足，明确说明不确定并向用户追问。\n"
-            "4. 不要编造上下文中不存在的事实。"
-        )
-
-    def _build_context_text(
-        self,
-        query: Optional[str],
-        relevant_items: List[Dict[str, Any]],
-        recent_items: List[Dict[str, Any]],
-        relations: List[Dict[str, Any]],
-    ) -> str:
-        all_items = relevant_items + recent_items
-        if not all_items and not relations:
-            return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
-
-        relation_section = self._build_relations_section(relations)
-        guidance_section = self._build_context_usage_guideline()
-
-        if not query or not query.strip():
-            sections: List[str] = []
-            recent_section = self._build_memory_section("以下是该用户的可用记忆：", recent_items)
-            if recent_section:
-                sections.append(recent_section)
-            if relation_section:
-                sections.append(relation_section)
-            if not sections:
-                return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
-            sections.append(guidance_section)
-            return "\n\n".join(sections)
-
-        sections: List[str] = []
-        relevant_section = self._build_memory_section("以下是与当前问题最相关的用户记忆：", relevant_items)
-        if relevant_section:
-            sections.append(relevant_section)
-
-        recent_section = self._build_memory_section("以下是最近记忆补充：", recent_items)
-        if recent_section:
-            sections.append(recent_section)
-
-        if relation_section:
-            sections.append(relation_section)
-
-        if not sections:
-            return "当前没有可用记忆。请仅基于当前用户输入进行回答。"
-        sections.append(guidance_section)
-        return "\n\n".join(sections)
-
-    @staticmethod
-    def _select_history_for_query_enhancement(
-        recent_memories: List[Dict[str, Any]],
-        max_items: int = 3,
-    ) -> List[str]:
-        history_items: List[str] = []
-
-        for item in recent_memories:
             text = (item.get("text") or "").strip()
             if not text:
                 continue
+            meta = item.get("metadata") or {}
 
-            history_items.append(text)
-            if len(history_items) >= max_items:
-                break
+            def _coerce_dt(value: Any) -> datetime:
+                if isinstance(value, datetime):
+                    return value
+                if isinstance(value, str):
+                    try:
+                        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    except ValueError:
+                        return now
+                return now
 
-        return history_items
-
-    def _get_openai_client(self) -> AsyncOpenAI:
-        if self._openai_client is None:
-            self._openai_client = AsyncOpenAI(
-                api_key=settings.OPENAI_API_KEY,
-                base_url=settings.OPENAI_BASE_URL,
+            ca = _coerce_dt(item.get("created_at"))
+            ua = _coerce_dt(item.get("updated_at"))
+            await pg_database.postgres_db.execute(
+                MEMORY_LEXICAL_UPSERT,
+                str(mid),
+                namespace,
+                subject_id,
+                run_id,
+                text,
+                json.dumps(meta),
+                ca,
+                ua,
             )
-        return self._openai_client
+
+    async def _delete_memory_lexical(self, memory_id: str) -> None:
+        if pg_database.postgres_db.pool is None:
+            return
+        await pg_database.postgres_db.execute(MEMORY_LEXICAL_DELETE, memory_id)
+
+    async def _update_memory_lexical(self, memory_id: str, content: str) -> None:
+        if pg_database.postgres_db.pool is None:
+            return
+        now = datetime.now(timezone.utc)
+        await pg_database.postgres_db.execute(MEMORY_LEXICAL_UPDATE, memory_id, content, now)
+
+    async def _search_bm25_in_db(
+        self,
+        namespace: str,
+        subject_id: str,
+        query: str,
+        run_id: Optional[str],
+        filters: Optional[Dict[str, Any]],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        if pg_database.postgres_db.pool is None or not query.strip():
+            return []
+        conditions = ["namespace = $1", "subject_id = $2"]
+        args: List[Any] = [namespace, subject_id]
+        n = 3
+        if run_id is not None:
+            conditions.append(f"run_id = ${n}")
+            args.append(run_id)
+            n += 1
+        if filters:
+            conditions.append(f"metadata @> ${n}::jsonb")
+            args.append(json.dumps(filters))
+            n += 1
+        conditions.append(f"content @@@ ${n}")
+        args.append(query)
+        n += 1
+        sql = f"""
+        SELECT memory_id, content, metadata, namespace, subject_id, run_id, created_at, updated_at,
+               paradedb.score(memory_id) AS bm25_score
+        FROM memory_lexical
+        WHERE {" AND ".join(conditions)}
+        ORDER BY paradedb.score(memory_id) DESC NULLS LAST
+        LIMIT ${n}
+        """
+        args.append(limit)
+        rows = await pg_database.postgres_db.fetch(sql, *args)
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            meta = r["metadata"]
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+            score = r["bm25_score"]
+            out.append(
+                {
+                    "id": r["memory_id"],
+                    "text": r["content"],
+                    "metadata": meta,
+                    "score": float(score) if score is not None else 0.0,
+                    "namespace": r["namespace"],
+                    "subject_id": r["subject_id"],
+                    "run_id": r["run_id"],
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                }
+            )
+        return out
 
     @staticmethod
-    def _build_query_rewrite_prompt(query: str, history_items: List[str]) -> str:
-        history_block = "\n".join(f"- {item}" for item in history_items)
-        return (
-            "你是一个检索查询改写助手。"
-            "请结合用户原始 query 和最近历史，生成一个更适合 memory 检索的增强 query。"
-            "只返回一行增强后的 query，不要解释，不要返回 JSON。\n\n"
-            f"原始 query:\n{query}\n\n"
-            f"最近历史:\n{history_block}"
-        )
-
-    async def _rewrite_query_with_llm(self, query: str, history_items: List[str]) -> str:
-        if not history_items:
-            return query.strip()
-
-        client = self._get_openai_client()
-        response = await client.chat.completions.create(
-            model=settings.OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "你负责把用户问题改写成更适合语义检索的简洁查询。",
-                },
-                {
-                    "role": "user",
-                    "content": self._build_query_rewrite_prompt(query.strip(), history_items),
-                },
-            ],
-        )
-        message = response.choices[0].message.content if response.choices else None
-        return (message or "").strip()
-
-    # ========================================================================
-    # Basic Memory Operations
-    # ========================================================================
+    def _filter_items_by_metadata(items: List[Dict[str, Any]], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not filters:
+            return items
+        return [
+            item
+            for item in items
+            if all(item.get("metadata", {}).get(k) == v for k, v in filters.items())
+        ]
 
     async def add_memory(
         self,
@@ -414,11 +326,9 @@ class Mem0Service:
         metadata: Optional[Dict[str, Any]] = None,
         run_id: Optional[str] = None,
         infer: bool = True,
-        enable_graph: bool = True,
     ) -> Dict[str, Any]:
         """Add a new memory for a subject."""
-        # 根据参数决定使用带图谱的客户端，还是纯向量客户端
-        memory_client = self._get_memory_client() if enable_graph else self._get_vector_only_memory_client()
+        memory_client = self._get_memory_client()
         subject_context = await self._get_subject_context(namespace, subject_id)
         result = await asyncio.to_thread(
             memory_client.add,
@@ -430,23 +340,23 @@ class Mem0Service:
             infer=infer,
         )
         normalized_results = self._normalize_results(result)
-        normalized_relations = self._normalize_relations(result)
         await self._track_successful_write(namespace, subject_id, len(normalized_results))
+        scoped = [
+            {**item, "namespace": namespace, "subject_id": subject_id, "run_id": run_id}
+            for item in normalized_results
+        ]
+        await self._persist_memory_lexical_batch(namespace, subject_id, run_id, scoped)
         if normalized_results:
-            return {
-                **normalized_results[0],
-                "relations": normalized_relations,
-            }
+            return normalized_results[0]
         return {
             "text": content,
             "metadata": metadata or {},
             "namespace": namespace,
             "subject_id": subject_id,
             "run_id": run_id,
-            "relations": normalized_relations,
         }
 
-    async def search_memories_with_relations(
+    async def search_memories_scoped(
         self,
         namespace: str,
         subject_id: str,
@@ -454,6 +364,7 @@ class Mem0Service:
         limit: int = 5,
         run_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
+        use_hybrid_search: bool = False,
     ) -> Dict[str, Any]:
         memory_client = self._get_memory_client()
         results = await asyncio.to_thread(
@@ -466,10 +377,30 @@ class Mem0Service:
             filters=filters,
         )
         await user_service.touch_subject(namespace, subject_id)
-        return {
-            "items": self._normalize_results(results),
-            "relations": self._normalize_relations(results),
-        }
+        items = self._normalize_results(results)
+        if not use_hybrid_search:
+            items = [{**item, "match_sources": ["vector"]} for item in items]
+
+        if use_hybrid_search:
+            bm25_items = await self._search_bm25_in_db(
+                namespace=namespace,
+                subject_id=subject_id,
+                query=query,
+                run_id=run_id,
+                filters=filters,
+                limit=limit * 2,
+            )
+            bm25_items = self._filter_items_by_metadata(bm25_items, filters or {})
+            if items or bm25_items:
+                items = self._merge_hybrid_results(
+                    items,
+                    bm25_items,
+                    vector_weight=settings.MEM0_HYBRID_VECTOR_WEIGHT,
+                    bm25_weight=settings.MEM0_HYBRID_BM25_WEIGHT,
+                    limit=limit,
+                )
+
+        return {"items": items}
 
     async def search_memories(
         self,
@@ -479,19 +410,21 @@ class Mem0Service:
         limit: int = 5,
         run_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
+        use_hybrid_search: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Search memories using semantic similarity."""
-        result = await self.search_memories_with_relations(
+        """Search memories using semantic similarity, optionally with hybrid (vector+BM25)."""
+        result = await self.search_memories_scoped(
             namespace=namespace,
             subject_id=subject_id,
             query=query,
             limit=limit,
             run_id=run_id,
             filters=filters,
+            use_hybrid_search=use_hybrid_search,
         )
         return result["items"]
 
-    async def get_all_memories_with_relations(
+    async def get_all_memories_scoped(
         self,
         namespace: str,
         subject_id: str,
@@ -506,10 +439,7 @@ class Mem0Service:
             run_id=run_id,
             limit=limit or 100,
         )
-        return {
-            "items": self._normalize_results(results),
-            "relations": self._normalize_relations(results),
-        }
+        return {"items": self._normalize_results(results)}
 
     async def get_all_memories(
         self,
@@ -519,181 +449,13 @@ class Mem0Service:
         run_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Get all memories for a subject."""
-        result = await self.get_all_memories_with_relations(
+        result = await self.get_all_memories_scoped(
             namespace=namespace,
             subject_id=subject_id,
             limit=limit,
             run_id=run_id,
         )
         return result["items"]
-
-    async def _search_memories_vector_only(
-        self,
-        namespace: str,
-        subject_id: str,
-        query: str,
-        limit: int,
-        run_id: Optional[str],
-    ) -> Dict[str, Any]:
-        memory_client = self._get_vector_only_memory_client()
-        results = await asyncio.to_thread(
-            memory_client.search,
-            query=query,
-            user_id=subject_id,
-            agent_id=namespace,
-            run_id=run_id,
-            limit=limit,
-        )
-        await user_service.touch_subject(namespace, subject_id)
-        return {
-            "items": self._normalize_results(results),
-            "relations": [],
-        }
-
-    async def _get_all_memories_vector_only(
-        self,
-        namespace: str,
-        subject_id: str,
-        limit: int,
-        run_id: Optional[str],
-    ) -> Dict[str, Any]:
-        memory_client = self._get_vector_only_memory_client()
-        results = await asyncio.to_thread(
-            memory_client.get_all,
-            user_id=subject_id,
-            agent_id=namespace,
-            run_id=run_id,
-            limit=limit,
-        )
-        return {
-            "items": self._normalize_results(results),
-            "relations": [],
-        }
-
-    async def get_context_for_llm(
-        self,
-        namespace: str,
-        subject_id: str,
-        query: Optional[str] = None,
-        limit: int = 15,
-        min_score: float = 0.5,
-        run_id: Optional[str] = None,
-        enable_query_rewrite: bool = True,
-        enable_graph_search: bool = True,
-    ) -> Dict[str, Any]:
-        """获取适合直接注入 LLM 的 RAG 风格上下文。"""
-        total_start = perf_counter()
-        normalized_query = query.strip() if query and query.strip() else None
-        enhanced_query: Optional[str] = None
-        history_used: List[str] = []
-        task_relevant_memories: List[Dict[str, Any]] = []
-        relevant_relations: List[Dict[str, Any]] = []
-
-        recent_fetch_start = perf_counter()
-        if enable_graph_search:
-            recent_memory_result = await self.get_all_memories_with_relations(
-                namespace=namespace,
-                subject_id=subject_id,
-                limit=limit,
-                run_id=run_id,
-            )
-        else:
-            recent_memory_result = await self._get_all_memories_vector_only(
-                namespace=namespace,
-                subject_id=subject_id,
-                limit=limit,
-                run_id=run_id,
-            )
-        recent_fetch_ms = (perf_counter() - recent_fetch_start) * 1000
-        recent_memories = recent_memory_result["items"]
-        recent_memories = self._sort_memories_by_recency(self._deduplicate_memory_items(recent_memories))
-        recent_relations = recent_memory_result["relations"]
-        rewrite_ms = 0.0
-        relevant_fetch_ms = 0.0
-
-        if normalized_query:
-            rewrite_start = perf_counter()
-            try:
-                if enable_query_rewrite:
-                    candidate_history = self._select_history_for_query_enhancement(recent_memories)
-                    rewritten_query = await self._rewrite_query_with_llm(normalized_query, candidate_history)
-                    enhanced_query = rewritten_query.strip() or normalized_query
-                    if enhanced_query != normalized_query:
-                        history_used = candidate_history
-                else:
-                    enhanced_query = normalized_query
-                    history_used = []
-            except Exception:
-                enhanced_query = normalized_query
-                history_used = []
-            rewrite_ms = (perf_counter() - rewrite_start) * 1000
-
-            relevant_fetch_start = perf_counter()
-            if enable_graph_search:
-                relevant_memory_result = await self.search_memories_with_relations(
-                    namespace=namespace,
-                    subject_id=subject_id,
-                    query=enhanced_query,
-                    limit=limit,
-                    run_id=run_id,
-                )
-            else:
-                relevant_memory_result = await self._search_memories_vector_only(
-                    namespace=namespace,
-                    subject_id=subject_id,
-                    query=enhanced_query,
-                    limit=limit,
-                    run_id=run_id,
-                )
-            relevant_fetch_ms = (perf_counter() - relevant_fetch_start) * 1000
-            task_relevant_memories = relevant_memory_result["items"]
-            task_relevant_memories = self._filter_relevant_memories_by_score(
-                task_relevant_memories,
-                min_score=min_score,
-            )
-            relevant_relations = relevant_memory_result["relations"]
-
-        merge_start = perf_counter()
-        grouped_sources = self._merge_context_sources(task_relevant_memories, recent_memories)
-        merged_items = grouped_sources["relevant"] + grouped_sources["recent"]
-        merged_relations = self._normalize_relations({"relations": relevant_relations + recent_relations})
-        merge_ms = (perf_counter() - merge_start) * 1000
-        result: Dict[str, Any] = {
-            "context": self._build_context_text(
-                query=normalized_query,
-                relevant_items=grouped_sources["relevant"],
-                recent_items=grouped_sources["recent"],
-                relations=merged_relations,
-            ),
-            "count": len(merged_items),
-            "query": normalized_query,
-            "enhanced_query": enhanced_query,
-            "history_used": history_used,
-            "sources": merged_items,
-            "relations": merged_relations,
-        }
-        total_ms = (perf_counter() - total_start) * 1000
-        logger.info(
-            (
-                "get_context_for_llm timing | namespace=%s subject_id=%s has_query=%s "
-                "enable_query_rewrite=%s enable_graph_search=%s "
-                "recent_fetch_ms=%.2f rewrite_ms=%.2f relevant_fetch_ms=%.2f merge_ms=%.2f total_ms=%.2f "
-                "sources=%d relations=%d"
-            ),
-            namespace,
-            subject_id,
-            bool(normalized_query),
-            enable_query_rewrite,
-            enable_graph_search,
-            recent_fetch_ms,
-            rewrite_ms,
-            relevant_fetch_ms,
-            merge_ms,
-            total_ms,
-            len(merged_items),
-            len(merged_relations),
-        )
-        return result
 
     async def update_memory(
         self,
@@ -710,6 +472,7 @@ class Mem0Service:
             data=content,
         )
         await user_service.touch_subject(namespace, subject_id)
+        await self._update_memory_lexical(str(memory_id), content)
         return {
             "id": memory_id,
             "text": content,
@@ -727,11 +490,8 @@ class Mem0Service:
         memory_client = self._get_memory_client()
         await asyncio.to_thread(memory_client.delete, memory_id=memory_id)
         await user_service.touch_subject(namespace, subject_id)
+        await self._delete_memory_lexical(str(memory_id))
         return True
-
-    # ========================================================================
-    # Batch Operations
-    # ========================================================================
 
     async def add_memories_batch(
         self,
@@ -741,10 +501,9 @@ class Mem0Service:
         metadata: Optional[Dict[str, Any]] = None,
         run_id: Optional[str] = None,
         infer: bool = True,
-        enable_graph: bool = True,
     ) -> Dict[str, Any]:
         """Add multiple memories in batch."""
-        
+
         async def _add_single(item: Dict[str, Any]):
             item_content = item["content"]
             item_metadata = dict(metadata or {})
@@ -757,7 +516,6 @@ class Mem0Service:
                     metadata=item_metadata,
                     run_id=run_id,
                     infer=infer,
-                    enable_graph=enable_graph,
                 )
             except Exception as exc:
                 print(f"Failed to add memory: {exc}")
@@ -774,10 +532,6 @@ class Mem0Service:
             "data": results,
         }
 
-    # ========================================================================
-    # Conversation Memory
-    # ========================================================================
-
     async def add_conversation_memory(
         self,
         namespace: str,
@@ -786,10 +540,9 @@ class Mem0Service:
         metadata: Optional[Dict[str, Any]] = None,
         run_id: Optional[str] = None,
         infer: bool = True,
-        enable_graph: bool = True,
     ) -> Dict[str, Any]:
         """Extract and store memories from structured conversation messages."""
-        memory_client = self._get_memory_client() if enable_graph else self._get_vector_only_memory_client()
+        memory_client = self._get_memory_client()
         subject_context = await self._get_subject_context(namespace, subject_id)
         result = await asyncio.to_thread(
             memory_client.add,
@@ -801,17 +554,16 @@ class Mem0Service:
             infer=infer,
         )
         normalized_results = self._normalize_results(result)
-        normalized_relations = self._normalize_relations(result)
         await self._track_successful_write(namespace, subject_id, len(normalized_results))
+        scoped = [
+            {**item, "namespace": namespace, "subject_id": subject_id, "run_id": run_id}
+            for item in normalized_results
+        ]
+        await self._persist_memory_lexical_batch(namespace, subject_id, run_id, scoped)
         return {
             "items": normalized_results,
             "count": len(normalized_results),
-            "relations": normalized_relations,
         }
-
-    # ========================================================================
-    # User Context Management
-    # ========================================================================
 
     async def set_subject_context(
         self,
@@ -832,12 +584,8 @@ class Mem0Service:
         return result
 
     async def get_subject_context(self, namespace: str, subject_id: str) -> Dict[str, Any]:
-        """Get stored subject context from MongoDB."""
+        """Get stored subject context from PostgreSQL."""
         return await self._get_subject_context(namespace, subject_id)
-
-    # ========================================================================
-    # Statistics and Utilities
-    # ========================================================================
 
     async def get_subject_stats(self, namespace: str, subject_id: str) -> Dict[str, Any]:
         """Get statistics about a subject's memories."""
@@ -847,7 +595,7 @@ class Mem0Service:
                 "namespace": namespace,
                 "subject_id": subject_id,
                 "total_memories": 0,
-                "collection_name": "mem0_global_memory",
+                "collection_name": settings.QDRANT_MEM0_COLLECTION,
             }
         all_memories = await self.get_all_memories(namespace=namespace, subject_id=subject_id)
         return {
@@ -856,7 +604,7 @@ class Mem0Service:
             "name": subject_stats.get("name"),
             "email": subject_stats.get("email"),
             "total_memories": len(all_memories),
-            "collection_name": "mem0_global_memory",
+            "collection_name": settings.QDRANT_MEM0_COLLECTION,
             "created_at": subject_stats.get("created_at"),
             "last_active": subject_stats.get("last_active"),
         }
@@ -866,5 +614,4 @@ class Mem0Service:
         return True
 
 
-# Global instance
 mem0_service = Mem0Service()

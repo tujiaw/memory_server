@@ -7,11 +7,13 @@ import pytest
 os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 os.environ.setdefault("OPENAI_BASE_URL", "https://example.com/v1")
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
+os.environ.setdefault("DATABASE_URL", "postgresql://memory:memory@localhost:5433/memory_server")
 os.environ.setdefault(
     "SERVICE_CLIENTS_JSON",
     '{"svc-agent":{"secret":"top-secret","namespaces":["team-a"]}}',
 )
 
+import app.database.postgres as pgmod
 import main
 
 
@@ -23,8 +25,8 @@ def client(monkeypatch):
     async def fake_disconnect():
         return None
 
-    monkeypatch.setattr(main.mongodb, "connect", fake_connect)
-    monkeypatch.setattr(main.mongodb, "disconnect", fake_disconnect)
+    monkeypatch.setattr(pgmod.postgres_db, "connect", fake_connect)
+    monkeypatch.setattr(pgmod.postgres_db, "disconnect", fake_disconnect)
     return TestClient(main.app)
 
 
@@ -42,7 +44,7 @@ def test_health_returns_503_when_dependency_is_unhealthy(client, monkeypatch):
         return {
             "status": "degraded",
             "services": {
-                "mongodb": "healthy",
+                "postgresql": "healthy",
                 "qdrant": "unhealthy",
                 "openai_config": "healthy",
             },

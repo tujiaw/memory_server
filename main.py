@@ -12,7 +12,7 @@ from app.core.config import settings
 from app.api.auth_routes import router as auth_router
 from app.api.mem0_routes import router as memories_router
 from app.api.user_routes import router as users_router
-from app.database.mongodb import mongodb
+from app.database import postgres as pg_database
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,18 +41,18 @@ async def lifespan(app: FastAPI):
     """Manage application lifespan events."""
     print(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     print(f"Qdrant: {settings.QDRANT_HOST}:{settings.QDRANT_PORT}")
-    print(f"MongoDB: {settings.MONGO_URI}")
+    print(f"PostgreSQL: {settings.DATABASE_URL.split('@')[-1] if '@' in settings.DATABASE_URL else settings.DATABASE_URL}")
     print(f"OpenAI: {settings.OPENAI_MODEL} + {settings.OPENAI_EMBEDDING_MODEL}")
-    await mongodb.connect()
+    await pg_database.postgres_db.connect()
     yield
     print("Shutting down...")
-    await mongodb.disconnect()
+    await pg_database.postgres_db.disconnect()
 
 
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    description="Internal Memory MVP API powered by FastAPI + mem0 + Qdrant + MongoDB",
+    description="Internal Memory MVP API powered by FastAPI + mem0 + Qdrant + ParadeDB",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
@@ -79,58 +79,46 @@ async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse
 
 
 @app.exception_handler(Exception)
-async def unexpected_exception_handler(_: Request, exc: Exception) -> JSONResponse:
+async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
+    logging.exception("Unhandled server error")
     return build_error_response(
-        code="INTERNAL_SERVER_ERROR",
+        code="INTERNAL_ERROR",
         message="Internal server error",
         detail=str(exc),
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
     )
-
-
-app.include_router(auth_router, prefix="/api/v1")
-app.include_router(admin_router, prefix="/api/v1")
-app.include_router(memories_router, prefix="/api/v1")
-app.include_router(users_router, prefix="/api/v1")
 
 
 @app.get("/")
 async def root():
-    """API information and available endpoints."""
     return {
-        "name": settings.APP_NAME,
+        "service": settings.APP_NAME,
         "version": settings.APP_VERSION,
-        "status": "running",
-        "docs": "/docs",
         "endpoints": {
             "token": "/api/v1/auth/token",
-            "admin_clients": "/api/v1/admin/clients",
-            "memories": "/api/v1/memories",
             "subjects": "/api/v1/subjects",
         },
-        "features": [
-            "Service-to-service JWT authentication",
-            "Subject-scoped semantic memory storage",
-            "Subject context management",
-            "Conversation memory extraction",
-            "Batch memory writes",
-        ],
     }
+
+
+app.include_router(auth_router, prefix="/api/v1")
+app.include_router(memories_router, prefix="/api/v1")
+app.include_router(users_router, prefix="/api/v1")
+app.include_router(admin_router, prefix="/api/v1")
 
 
 async def collect_health_status() -> Dict[str, Any]:
     services: Dict[str, str] = {
-        "mongodb": "healthy",
+        "postgresql": "healthy",
         "qdrant": "healthy",
         "openai_config": "healthy",
     }
 
     try:
-        if mongodb.client is None:
-            raise RuntimeError("MongoDB client is not initialized")
-        await mongodb.client.admin.command("ping")
+        if pg_database.postgres_db.pool is None:
+            raise RuntimeError("PostgreSQL pool is not initialized")
+        await pg_database.postgres_db.fetchval("SELECT 1")
     except Exception:
-        services["mongodb"] = "unhealthy"
+        services["postgresql"] = "unhealthy"
 
     try:
         qdrant_client = QdrantClient(
@@ -166,5 +154,4 @@ if __name__ == "__main__":
         host=settings.HOST,
         port=settings.PORT,
         reload=settings.DEBUG,
-        log_level="info",
     )

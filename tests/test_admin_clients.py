@@ -1,5 +1,4 @@
 import os
-from copy import deepcopy
 
 from fastapi.testclient import TestClient
 import pytest
@@ -8,88 +7,23 @@ import pytest
 os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 os.environ.setdefault("OPENAI_BASE_URL", "https://example.com/v1")
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
+os.environ.setdefault("DATABASE_URL", "postgresql://memory:memory@localhost:5433/memory_server")
 os.environ.setdefault("ADMIN_API_TOKEN", "test-admin-token")
 os.environ.setdefault(
     "SERVICE_CLIENTS_JSON",
     '{"svc-agent":{"secret":"top-secret","namespaces":["team-a"]}}',
 )
 
+import app.database.postgres as pgmod
 import main
 from app.core.config import settings
-
-
-class FakeCursor:
-    def __init__(self, documents):
-        self._documents = [deepcopy(document) for document in documents]
-
-    async def to_list(self, length=None):
-        if length is None:
-            return list(self._documents)
-        return list(self._documents[:length])
-
-
-class FakeDeleteResult:
-    def __init__(self, deleted_count):
-        self.deleted_count = deleted_count
-
-
-class FakeServiceClientCollection:
-    def __init__(self):
-        self.documents = {}
-
-    async def find_one(self, query):
-        if "_id" in query:
-            document = self.documents.get(query["_id"])
-            return deepcopy(document) if document is not None else None
-
-        if "client_id" in query:
-            for document in self.documents.values():
-                if document.get("client_id") == query["client_id"]:
-                    return deepcopy(document)
-        return None
-
-    async def insert_one(self, document):
-        self.documents[document["_id"]] = deepcopy(document)
-
-    def find(self, query=None):
-        query = query or {}
-        matched = []
-        for document in self.documents.values():
-            if all(document.get(key) == value for key, value in query.items()):
-                matched.append(deepcopy(document))
-        return FakeCursor(matched)
-
-    async def update_one(self, query, update):
-        document = await self.find_one(query)
-        if document is None:
-            return FakeDeleteResult(0)
-        if "$set" in update:
-            for key, value in update["$set"].items():
-                document[key] = value
-            self.documents[document["_id"]] = deepcopy(document)
-        return FakeDeleteResult(1)
-
-    async def delete_one(self, query):
-        document = await self.find_one(query)
-        if document is None:
-            return FakeDeleteResult(0)
-        self.documents.pop(document["_id"], None)
-        return FakeDeleteResult(1)
+from tests.fake_postgres import FakePostgresDB
 
 
 @pytest.fixture
 def admin_client(monkeypatch):
-    fake_collection = FakeServiceClientCollection()
-
-    async def fake_connect():
-        return None
-
-    async def fake_disconnect():
-        return None
-
-    monkeypatch.setattr(main.mongodb, "connect", fake_connect)
-    monkeypatch.setattr(main.mongodb, "disconnect", fake_disconnect)
-    monkeypatch.setattr(main.mongodb, "get_collection", lambda _: fake_collection)
+    fake_pg = FakePostgresDB()
+    monkeypatch.setattr(pgmod, "postgres_db", fake_pg)
     monkeypatch.setattr(settings, "ADMIN_API_TOKEN", "test-admin-token")
 
     return TestClient(main.app)
@@ -174,14 +108,14 @@ def test_reset_client_secret_returns_new_secret_and_invalidates_old(admin_client
     assert new_token_resp.status_code == 200
 
 
-def test_issue_token_prefers_mongodb_client_over_env_fallback(admin_client):
+def test_issue_token_prefers_database_client_over_env_fallback(admin_client):
     create_response = admin_client.post(
         "/api/v1/admin/clients",
         headers={"X-Admin-Token": "test-admin-token"},
         json={
             "client_id": "svc-agent",
             "namespaces": ["team-b"],
-            "description": "mongodb override",
+            "description": "database override",
         },
     )
 

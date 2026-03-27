@@ -8,10 +8,17 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 from app.core.config import settings
-from app.database.mongodb import get_service_client_collection, get_service_token_collection
+from app.database import postgres as pg_database
+from app.database.sql import (
+    SERVICE_CLIENT_DELETE,
+    SERVICE_CLIENT_INSERT,
+    SERVICE_CLIENT_LIST,
+    SERVICE_CLIENT_SELECT,
+    SERVICE_TOKEN_INSERT,
+    SERVICE_TOKEN_SELECT,
+)
 from app.models.schemas import AuthContext
 
-# 密码加密
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
@@ -37,17 +44,18 @@ class AuthService:
         client_id: str,
         client_secret: str,
     ) -> Optional[ServiceClient]:
-        mongo_client = await self._get_service_client_document(client_id)
-        if mongo_client is not None:
-            if not mongo_client.get("is_active", True):
-                return None
-            if not self.verify_password(client_secret, mongo_client["client_secret_hash"]):
-                return None
-            return self._build_service_client(
-                client_id=client_id,
-                client_secret=client_secret,
-                namespaces=mongo_client.get("namespaces", []),
-            )
+        if pg_database.postgres_db.pool is not None:
+            row = await pg_database.postgres_db.fetchrow(SERVICE_CLIENT_SELECT, client_id)
+            if row is not None:
+                if not row["is_active"]:
+                    return None
+                if not self.verify_password(client_secret, row["client_secret_hash"]):
+                    return None
+                return self._build_service_client(
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    namespaces=list(row["namespaces"] or []),
+                )
 
         return self._validate_settings_service_client(client_id, client_secret)
 
@@ -57,35 +65,40 @@ class AuthService:
         namespaces: List[str],
         description: Optional[str] = None,
     ) -> Dict[str, Any]:
-        collection = await get_service_client_collection()
-        existing_client = await self._get_service_client_document(client_id)
-
-        if existing_client is not None:
+        if pg_database.postgres_db.pool is None:
+            raise RuntimeError("PostgreSQL is not initialized")
+        existing = await pg_database.postgres_db.fetchrow(SERVICE_CLIENT_SELECT, client_id)
+        if existing is not None:
             raise ValueError(f"Service client '{client_id}' already exists")
 
         client_secret = secrets.token_urlsafe(32)
         now = datetime.now(timezone.utc)
+        await pg_database.postgres_db.execute(
+            SERVICE_CLIENT_INSERT,
+            client_id,
+            self.hash_password(client_secret),
+            list(namespaces),
+            description,
+            now,
+        )
         document = {
-            "_id": client_id,
             "client_id": client_id,
-            "client_secret_hash": self.hash_password(client_secret),
             "namespaces": list(namespaces),
             "description": description,
             "created_at": now,
             "updated_at": now,
             "is_active": True,
         }
-        await collection.insert_one(document)
         return {
             **self._serialize_service_client(document),
             "client_secret": client_secret,
         }
 
     async def list_service_clients(self) -> List[Dict[str, Any]]:
-        collection = await get_service_client_collection()
-        documents = await collection.find({"is_active": True}).to_list(length=None)
-        documents.sort(key=lambda document: document["client_id"])
-        return [self._serialize_service_client(document) for document in documents]
+        if pg_database.postgres_db.pool is None:
+            return []
+        rows = await pg_database.postgres_db.fetch(SERVICE_CLIENT_LIST)
+        return [self._serialize_service_client(dict(row)) for row in rows]
 
     async def update_service_client(
         self,
@@ -94,42 +107,68 @@ class AuthService:
         description: Optional[str] = None,
         is_active: Optional[bool] = None,
     ) -> Optional[Dict[str, Any]]:
-        collection = await get_service_client_collection()
-        existing = await self._get_service_client_document(client_id)
+        if pg_database.postgres_db.pool is None:
+            return None
+        existing = await pg_database.postgres_db.fetchrow(SERVICE_CLIENT_SELECT, client_id)
         if existing is None:
             return None
 
-        update_data: Dict[str, Any] = {"updated_at": datetime.now(timezone.utc)}
+        now = datetime.now(timezone.utc)
+        parts: List[str] = ["updated_at = $1"]
+        args: List[Any] = [now]
+        idx = 2
         if namespaces is not None:
-            update_data["namespaces"] = list(namespaces)
+            parts.append(f"namespaces = ${idx}")
+            args.append(list(namespaces))
+            idx += 1
         if description is not None:
-            update_data["description"] = description
+            parts.append(f"description = ${idx}")
+            args.append(description)
+            idx += 1
         if is_active is not None:
-            update_data["is_active"] = is_active
+            parts.append(f"is_active = ${idx}")
+            args.append(is_active)
+            idx += 1
+        args.append(client_id)
+        sql = f"UPDATE service_clients SET {', '.join(parts)} WHERE client_id = ${idx}"
+        await pg_database.postgres_db.execute(sql, *args)
 
-        await collection.update_one({"_id": client_id}, {"$set": update_data})
+        updated = await pg_database.postgres_db.fetchrow(SERVICE_CLIENT_SELECT, client_id)
+        if updated is None:
+            return None
         return self._serialize_service_client(
-            {**existing, **update_data}
+            {
+                "client_id": updated["client_id"],
+                "namespaces": list(updated["namespaces"] or []),
+                "description": updated["description"],
+                "created_at": updated["created_at"],
+                "updated_at": updated["updated_at"],
+                "is_active": updated["is_active"],
+            }
         )
 
     async def reset_client_secret(self, client_id: str) -> Optional[Dict[str, Any]]:
-        collection = await get_service_client_collection()
-        existing = await self._get_service_client_document(client_id)
+        if pg_database.postgres_db.pool is None:
+            return None
+        existing = await pg_database.postgres_db.fetchrow(SERVICE_CLIENT_SELECT, client_id)
         if existing is None:
             return None
 
         new_secret = secrets.token_urlsafe(32)
         now = datetime.now(timezone.utc)
-        await collection.update_one(
-            {"_id": client_id},
-            {"$set": {"client_secret_hash": self.hash_password(new_secret), "updated_at": now}},
+        await pg_database.postgres_db.execute(
+            "UPDATE service_clients SET client_secret_hash = $1, updated_at = $2 WHERE client_id = $3",
+            self.hash_password(new_secret),
+            now,
+            client_id,
         )
         return {"client_id": client_id, "client_secret": new_secret}
 
     async def delete_service_client(self, client_id: str) -> bool:
-        collection = await get_service_client_collection()
-        result = await collection.delete_one({"_id": client_id})
-        return result.deleted_count > 0
+        if pg_database.postgres_db.pool is None:
+            return False
+        status = await pg_database.postgres_db.execute(SERVICE_CLIENT_DELETE, client_id)
+        return status == "DELETE 1"
 
     def _validate_settings_service_client(
         self,
@@ -149,15 +188,6 @@ class AuthService:
             client_secret=client_secret,
             namespaces=client_config.get("namespaces", []),
         )
-
-    @staticmethod
-    async def _get_service_client_document(client_id: str) -> Optional[Dict[str, Any]]:
-        try:
-            collection = await get_service_client_collection()
-        except TypeError:
-            return None
-
-        return await collection.find_one({"_id": client_id})
 
     @staticmethod
     def _build_service_client(
@@ -218,7 +248,6 @@ class AuthService:
         return token
 
     def create_access_token(self, data: dict, expires_delta: Optional[timedelta] = None) -> str:
-        """兼容旧调用，内部转为服务 token。"""
         to_encode = data.copy()
         return self.create_service_token(
             service_id=to_encode.get("sub", ""),
@@ -227,7 +256,6 @@ class AuthService:
         )
 
     async def verify_token(self, token: str) -> Optional[AuthContext]:
-        """验证 token 并返回服务身份上下文。"""
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
             service_id = payload.get("sub")
@@ -235,13 +263,14 @@ class AuthService:
                 return None
 
             namespaces = payload.get("namespaces", [])
-
             if not isinstance(namespaces, list):
                 return None
 
-            token_collection = await self._get_service_token_collection()
-            if token_collection is not None:
-                persisted_token = await token_collection.find_one({"_id": self._hash_token(token)})
+            if pg_database.postgres_db.pool is not None:
+                persisted_token = await pg_database.postgres_db.fetchrow(
+                    SERVICE_TOKEN_SELECT,
+                    self._hash_token(token),
+                )
                 if persisted_token is None:
                     return None
 
@@ -259,14 +288,11 @@ class AuthService:
             return None
 
     def hash_password(self, password: str) -> str:
-        """兼容旧用户数据结构的密码哈希。"""
-        # bcrypt 有 72 字节限制，截断超长密码
         if len(password.encode("utf-8")) > 72:
             password = password.encode("utf-8")[:72].decode("utf-8", errors="ignore")
         return pwd_context.hash(password)
 
     def verify_password(self, plain_password: str, hashed_password: str) -> bool:
-        """兼容旧用户数据结构的密码校验。"""
         return pwd_context.verify(plain_password, hashed_password)
 
     @staticmethod
@@ -294,30 +320,18 @@ class AuthService:
         namespaces: List[str],
         expires_at: datetime,
     ) -> None:
-        collection = await self._get_service_token_collection()
-        if collection is None:
+        if pg_database.postgres_db.pool is None:
             return
 
         now = datetime.now(timezone.utc)
-        await collection.insert_one(
-            {
-                "_id": self._hash_token(token),
-                "service_id": service_id,
-                "namespaces": list(namespaces),
-                "expires_at": expires_at,
-                "created_at": now,
-                "updated_at": now,
-                "is_active": True,
-            }
+        await pg_database.postgres_db.execute(
+            SERVICE_TOKEN_INSERT,
+            self._hash_token(token),
+            service_id,
+            list(namespaces),
+            expires_at,
+            now,
         )
 
-    @staticmethod
-    async def _get_service_token_collection():
-        try:
-            return await get_service_token_collection()
-        except TypeError:
-            return None
 
-
-# 全局实例
 auth_service = AuthService()

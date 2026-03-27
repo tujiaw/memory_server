@@ -1,5 +1,9 @@
 version: "3.8"
 
+# 数据持久化：默认写入项目旁 ./data/，可通过环境变量 DATA_DIR 指向外挂盘，例如：
+#   DATA_DIR=/mnt/ssd/memory-server-data docker compose up -d
+# 首次启动前建议：mkdir -p "$DATA_DIR/qdrant" "$DATA_DIR/paradedb"
+
 services:
   qdrant:
     image: qdrant/qdrant:v1.12.0
@@ -8,7 +12,7 @@ services:
       - "6333:6333"   # HTTP API
       - "6334:6334"   # gRPC API
     volumes:
-      - qdrant_storage:/qdrant/storage
+      - ${DATA_DIR:-./data}/qdrant:/qdrant/storage
     environment:
       - QDRANT__LOG_LEVEL=DEBUG
     command: ./qdrant --config-path /qdrant/config/production.yaml
@@ -19,58 +23,22 @@ services:
       timeout: 5s
       retries: 5
 
-  mongodb:
-    image: mongo:8.0
-    container_name: memory-mongodb
+  paradedb:
+    image: paradedb/paradedb:latest-pg16
+    container_name: memory-paradedb
     ports:
-      - "27017:27017"   # MongoDB
+      - "5433:5432"   # 避免与宿主机已有 PostgreSQL 占用 5432
     volumes:
-      - mongodb_data:/data/db
+      - ${DATA_DIR:-./data}/paradedb:/var/lib/postgresql/data
     environment:
-      - MONGO_INITDB_DATABASE=memory_server
+      POSTGRES_USER: memory
+      POSTGRES_PASSWORD: memory
+      POSTGRES_DB: memory_server
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      test: ["CMD-SHELL", "pg_isready -U memory -d memory_server"]
       interval: 10s
       timeout: 5s
-      retries: 5
-
-  mongo-express:
-    image: mongo-express:1.0
-    container_name: memory-mongo-express
-    ports:
-      - "8081:8081"
-    environment:
-      - ME_CONFIG_MONGODB_URL=mongodb://mongodb:27017
-      - ME_CONFIG_BASICAUTH_USERNAME=admin
-      - ME_CONFIG_BASICAUTH_PASSWORD=admin123
-    depends_on:
-      - mongodb
-    restart: unless-stopped
-
-  neo4j:
-    image: neo4j:5.26-community
-    container_name: memory-neo4j
-    ports:
-      - "7474:7474"   # Neo4j Browser
-      - "7687:7687"   # Bolt
-    volumes:
-      - neo4j_data:/data
-      - neo4j_plugins:/plugins
-    environment:
-      NEO4J_AUTH: ${NEO4J_AUTH:-neo4j/neo4j123456}
-      NEO4J_PLUGINS: '["apoc"]'
-      NEO4J_dbms_security_procedures_unrestricted: apoc.*
-      NEO4J_dbms_security_procedures_allowlist: apoc.*
-      NEO4J_server_memory_heap_initial__size: 256m
-      NEO4J_server_memory_heap_max__size: 512m
-      NEO4J_server_memory_pagecache_size: 256m
-    mem_limit: 1g
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "echo 'RETURN 1;' | cypher-shell -u neo4j -p \"$${NEO4J_AUTH#*/}\" || exit 1"]
-      interval: 15s
-      timeout: 10s
       retries: 10
 
   api:
@@ -84,25 +52,10 @@ services:
       - PORT=8899
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
-      - MONGO_URI=mongodb://mongodb:27017
-      - NEO4J_URL=bolt://neo4j:7687
-      - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
-      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-neo4j123456}
+      - DATABASE_URL=postgresql://memory:memory@paradedb:5432/memory_server
     depends_on:
       qdrant:
         condition: service_healthy
-      mongodb:
-        condition: service_healthy
-      neo4j:
+      paradedb:
         condition: service_healthy
     restart: unless-stopped
-
-volumes:
-  qdrant_storage:
-    driver: local
-  mongodb_data:
-    driver: local
-  neo4j_data:
-    driver: local
-  neo4j_plugins:
-    driver: local

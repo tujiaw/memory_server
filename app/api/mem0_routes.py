@@ -6,8 +6,6 @@ from app.models.schemas import (
     MemoryAdd,
     ConversationMemory,
     BatchMemoryResponse,
-    MemoryContextRequest,
-    MemoryContextResponse,
     MemoryDelete,
     MemoryListResponse,
     MemoryResponse,
@@ -36,7 +34,6 @@ async def add_memory(
             metadata=request.metadata,
             run_id=request.run_id,
             infer=request.infer,
-            enable_graph=request.enable_graph,
         )
         return MemoryResponse(success=True, message="Memory added successfully", data=result)
     except HTTPException:
@@ -48,34 +45,6 @@ async def add_memory(
         )
 
 
-@router.post("/context", response_model=MemoryContextResponse)
-async def get_memory_context(
-    request: MemoryContextRequest,
-    auth_context: Annotated[AuthContext, Depends(get_auth_context)],
-):
-    """获取可直接注入大模型的记忆上下文。有 query 时先用 LLM 结合最近历史改写再检索，无 query 时取最近记忆。"""
-    try:
-        authorize_namespace(auth_context, request.namespace)
-        result = await mem0_service.get_context_for_llm(
-            namespace=request.namespace,
-            subject_id=request.subject_id,
-            query=request.query,
-            limit=request.limit,
-            min_score=request.min_score,
-            run_id=request.run_id,
-            enable_query_rewrite=request.enable_query_rewrite,
-            enable_graph_search=request.enable_graph_search,
-        )
-        return MemoryContextResponse(**result)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get memory context: {str(e)}",
-        )
-
-
 @router.post("/search", response_model=MemoryListResponse)
 async def search_memories(
     request: MemorySearch,
@@ -84,19 +53,19 @@ async def search_memories(
     """Search memories by namespace, subject, and optional run."""
     try:
         authorize_namespace(auth_context, request.namespace)
-        result = await mem0_service.search_memories_with_relations(
+        result = await mem0_service.search_memories_scoped(
             namespace=request.namespace,
             subject_id=request.subject_id,
             query=request.query,
             limit=request.limit,
             run_id=request.run_id,
             filters=request.filters,
+            use_hybrid_search=request.use_hybrid_search,
         )
         return MemoryListResponse(
             success=True,
             data=result["items"],
             count=len(result["items"]),
-            relations=result["relations"],
         )
     except HTTPException:
         raise
@@ -118,7 +87,7 @@ async def get_all_memories(
     """Get all memories for a subject."""
     try:
         authorize_namespace(auth_context, namespace)
-        result = await mem0_service.get_all_memories_with_relations(
+        result = await mem0_service.get_all_memories_scoped(
             namespace=namespace,
             subject_id=subject_id,
             limit=limit,
@@ -128,7 +97,6 @@ async def get_all_memories(
             success=True,
             data=result["items"],
             count=len(result["items"]),
-            relations=result["relations"],
         )
     except HTTPException:
         raise
@@ -200,7 +168,6 @@ async def add_memories_batch(
             metadata=request.metadata,
             run_id=request.run_id,
             infer=request.infer,
-            enable_graph=request.enable_graph,
         )
         return BatchMemoryResponse(**result)
     except HTTPException:
@@ -226,7 +193,6 @@ async def add_conversation_memory(
             metadata=request.metadata,
             run_id=request.run_id,
             infer=request.infer,
-            enable_graph=request.enable_graph,
         )
         return MemoryResponse(success=True, message="Conversation memories added", data=result)
     except HTTPException:

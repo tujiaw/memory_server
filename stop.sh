@@ -1,8 +1,11 @@
 #!/bin/bash
 
-echo "🛑 停止 Memory Server..."
+set -e
 
-# 停止 Qdrant
+echo "====================================="
+echo " Memory Server 依赖容器停止"
+echo "====================================="
+
 if [ ! -z "$(docker ps -q -f name=memory-qdrant)" ]; then
     echo "停止 Qdrant..."
     docker stop memory-qdrant
@@ -10,12 +13,9 @@ if [ ! -z "$(docker ps -q -f name=memory-qdrant)" ]; then
     echo "✅ Qdrant 已停止"
 fi
 
-# 停止 MongoDB
-if [ ! -z "$(docker ps -q -f name=memory-mongodb)" ]; then
-    echo "停止 MongoDB..."
-    docker stop memory-mongodb
-    docker rm memory-mongodb
-    echo "✅ MongoDB 已停止"
+if [ ! -z "$(docker ps -q -f name=memory-paradedb)" ]; then
+    echo "停止 ParadeDB..."
+    docker stop memory-paradedb
+    docker rm memory-paradedb
+    echo "✅ ParadeDB 已停止"
 fi
-
-echo "✅ 所有服务已停止"

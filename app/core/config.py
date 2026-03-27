@@ -19,20 +19,15 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8899
 
+    DATABASE_URL: str = "postgresql://memory:memory@localhost:5433/memory_server"
+
     # Qdrant
     QDRANT_HOST: str = "localhost"
     QDRANT_PORT: int = 6333
     QDRANT_GRPC_PORT: int = 6334
     QDRANT_API_KEY: str = ""
+    QDRANT_MEM0_COLLECTION: str = "mem0_global_memory"
     VECTOR_SIZE: int = 1536
-
-    # MongoDB
-    MONGO_URI: str = "mongodb://localhost:27017"
-    MONGO_DB: str = "memory_server"
-    MONGO_COLLECTION_USERS: str = "users"
-    MONGO_COLLECTION_SUBJECTS: str = "subjects"
-    MONGO_COLLECTION_SERVICE_CLIENTS: str = "service_clients"
-    MONGO_COLLECTION_SERVICE_TOKENS: str = "service_tokens"
 
     # OpenAI Configuration
     OPENAI_API_KEY: str
@@ -43,10 +38,8 @@ class Settings(BaseSettings):
     # Mem0 Configuration
     MEM0_API_KEY: str = ""
     MEM0_SEARCH_MSG_LIMIT: int = 5
-    NEO4J_URL: str = ""
-    NEO4J_USERNAME: str = ""
-    NEO4J_PASSWORD: str = ""
-    MEM0_GRAPH_CUSTOM_PROMPT: str = ""
+    MEM0_HYBRID_VECTOR_WEIGHT: float = 0.7
+    MEM0_HYBRID_BM25_WEIGHT: float = 0.3
 
     # Security
     SECRET_KEY: str
