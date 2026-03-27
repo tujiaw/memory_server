@@ -112,22 +112,43 @@ class Mem0Service:
         return messages
 
     @staticmethod
+    def _dt_to_api_str(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    @staticmethod
     def _normalize_memory_result(result: Dict[str, Any]) -> Dict[str, Any]:
         metadata = result.get("metadata")
         out: Dict[str, Any] = {
             "id": result.get("id"),
             "text": result.get("memory") or result.get("text", ""),
             "metadata": metadata,
-            "score": result.get("score"),
-            "namespace": result.get("agent_id"),
-            "subject_id": result.get("user_id"),
+            "namespace": result.get("agent_id") or result.get("namespace"),
+            "subject_id": result.get("user_id") or result.get("subject_id"),
             "run_id": result.get("run_id"),
-            "created_at": result.get("created_at"),
-            "updated_at": result.get("updated_at"),
+            "created_at": Mem0Service._dt_to_api_str(result.get("created_at")),
+            "updated_at": Mem0Service._dt_to_api_str(result.get("updated_at")),
         }
+        if "fusion_score" in result:
+            out["fusion_score"] = result["fusion_score"]
+        if "vector_score" in result:
+            out["vector_score"] = result["vector_score"]
+        if "lexical_score" in result:
+            out["lexical_score"] = result["lexical_score"]
         if result.get("match_sources") is not None:
             out["match_sources"] = result["match_sources"]
         return out
+
+    @staticmethod
+    def _finalize_search_item(row: Dict[str, Any]) -> Dict[str, Any]:
+        row = {k: v for k, v in row.items() if k != "_norm_score"}
+        row.pop("score", None)
+        return Mem0Service._normalize_memory_result(row)
 
     def _normalize_results(self, payload: Any) -> List[Dict[str, Any]]:
         if isinstance(payload, dict):
@@ -137,13 +158,29 @@ class Mem0Service:
         return [self._normalize_memory_result(result) for result in results]
 
     @staticmethod
+    def _score_to_unit_interval(raw: Any) -> float:
+        """供融合用：余弦类 [0,1] 保持；BM25 等无界正分压缩到 (0,1)，避免单条时 _norm_score 缺失变 0。"""
+        try:
+            x = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        if x <= 0:
+            return 0.0
+        if x <= 1.0:
+            return x
+        return x / (x + 1.0)
+
+    @staticmethod
     def _normalize_scores(items: List[Dict[str, Any]], score_key: str = "score") -> List[Dict[str, Any]]:
         if not items:
             return items
         scores = [item.get(score_key) or 0 for item in items]
         lo, hi = min(scores), max(scores)
         if hi <= lo:
-            return items
+            return [
+                {**item, "_norm_score": Mem0Service._score_to_unit_interval(item.get(score_key))}
+                for item in items
+            ]
         return [
             {**item, "_norm_score": ((item.get(score_key) or 0) - lo) / (hi - lo)}
             for item in items
@@ -153,9 +190,9 @@ class Mem0Service:
     def _merge_hybrid_results(
         vector_items: List[Dict[str, Any]],
         bm25_items: List[Dict[str, Any]],
-        vector_weight: float = 0.7,
-        bm25_weight: float = 0.3,
-        limit: int = 5,
+        vector_weight: float,
+        lexical_weight: float,
+        limit: int,
     ) -> List[Dict[str, Any]]:
         vector_norm = Mem0Service._normalize_scores(vector_items)
         bm25_norm = Mem0Service._normalize_scores(bm25_items)
@@ -166,18 +203,33 @@ class Mem0Service:
         for mid in all_ids:
             v_item = id_to_vector.get(mid)
             b_item = id_to_bm25.get(mid)
-            v_score = v_item.get("_norm_score", 0) if v_item else 0
-            b_score = b_item.get("_norm_score", 0) if b_item else 0
-            hybrid_score = vector_weight * v_score + bm25_weight * b_score
-            base = v_item or b_item or {}
+            v_n = v_item.get("_norm_score", 0) if v_item else 0.0
+            b_n = b_item.get("_norm_score", 0) if b_item else 0.0
+            fusion = vector_weight * v_n + lexical_weight * b_n
+            base_src = v_item if v_item else b_item
+            base = {k: v for k, v in (base_src or {}).items() if k != "_norm_score"}
+            v_raw = None
+            b_raw = None
+            if v_item is not None and v_item.get("score") is not None:
+                v_raw = float(v_item["score"])
+            if b_item is not None and b_item.get("score") is not None:
+                b_raw = float(b_item["score"])
             match_sources: List[str] = []
             if v_item:
                 match_sources.append("vector")
             if b_item:
                 match_sources.append("bm25")
-            merged.append({**base, "score": hybrid_score, "match_sources": match_sources})
-        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
-        return [Mem0Service._normalize_memory_result({**m, "score": m.get("score")}) for m in merged[:limit]]
+            merged.append(
+                {
+                    **base,
+                    "fusion_score": fusion,
+                    "vector_score": v_raw,
+                    "lexical_score": b_raw,
+                    "match_sources": match_sources,
+                }
+            )
+        merged.sort(key=lambda x: x.get("fusion_score") or 0.0, reverse=True)
+        return [Mem0Service._finalize_search_item(m) for m in merged[:limit]]
 
     @staticmethod
     def _deduplicate_memory_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -197,6 +249,18 @@ class Mem0Service:
             deduplicated.append(item)
 
         return deduplicated
+
+    def _resolve_fusion_weights(
+        self,
+        vector_weight: Optional[float],
+        lexical_weight: Optional[float],
+    ) -> tuple[float, float]:
+        vw = settings.MEM0_HYBRID_VECTOR_WEIGHT if vector_weight is None else vector_weight
+        lw = settings.MEM0_HYBRID_BM25_WEIGHT if lexical_weight is None else lexical_weight
+        total = vw + lw
+        if total <= 0:
+            return 0.7, 0.3
+        return vw / total, lw / total
 
     async def _persist_memory_lexical_batch(
         self,
@@ -274,7 +338,10 @@ class Mem0Service:
             conditions.append(f"metadata @> ${n}::jsonb")
             args.append(json.dumps(filters))
             n += 1
-        conditions.append(f"content @@@ ${n}")
+        # Lindera 中文分词索引 + 词项按 OR 匹配（与默认 @@@ 字符串的 AND 语义不同，避免「今天的天气」因文档无「的」而零命中）
+        conditions.append(
+            f"content @@@ paradedb.match('content', ${n}, conjunction_mode => false)"
+        )
         args.append(query)
         n += 1
         sql = f"""
@@ -307,16 +374,6 @@ class Mem0Service:
                 }
             )
         return out
-
-    @staticmethod
-    def _filter_items_by_metadata(items: List[Dict[str, Any]], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
-        if not filters:
-            return items
-        return [
-            item
-            for item in items
-            if all(item.get("metadata", {}).get(k) == v for k, v in filters.items())
-        ]
 
     async def add_memory(
         self,
@@ -362,45 +419,87 @@ class Mem0Service:
         subject_id: str,
         query: str,
         limit: int = 5,
+        fusion: str = "hybrid",
+        vector_min_score: float = 0.5,
+        lexical_min_score: Optional[float] = None,
+        min_fusion_score: Optional[float] = None,
+        vector_weight: Optional[float] = None,
+        lexical_weight: Optional[float] = None,
         run_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
-        use_hybrid_search: bool = False,
     ) -> Dict[str, Any]:
         memory_client = self._get_memory_client()
-        results = await asyncio.to_thread(
-            memory_client.search,
-            query=query,
-            user_id=subject_id,
-            agent_id=namespace,
-            run_id=run_id,
-            limit=limit,
-            filters=filters,
-        )
-        await user_service.touch_subject(namespace, subject_id)
-        items = self._normalize_results(results)
-        if not use_hybrid_search:
-            items = [{**item, "match_sources": ["vector"]} for item in items]
 
-        if use_hybrid_search:
+        async def _vector_hits(search_limit: int, threshold: float) -> List[Dict[str, Any]]:
+            payload = await asyncio.to_thread(
+                memory_client.search,
+                query=query,
+                user_id=subject_id,
+                agent_id=namespace,
+                run_id=run_id,
+                limit=search_limit,
+                filters=filters,
+                threshold=threshold,
+            )
+            return self._normalize_results(payload)
+
+        if fusion == "vector":
+            items_raw = await _vector_hits(limit, vector_min_score)
+            await user_service.touch_subject(namespace, subject_id)
+            out: List[Dict[str, Any]] = []
+            for it in items_raw:
+                vs = it.get("score")
+                vf = float(vs) if vs is not None else None
+                row = {**it, "fusion_score": vf, "vector_score": vf, "lexical_score": None, "match_sources": ["vector"]}
+                out.append(self._finalize_search_item(row))
+            return {"items": out}
+
+        if fusion == "lexical":
+            await user_service.touch_subject(namespace, subject_id)
             bm25_items = await self._search_bm25_in_db(
                 namespace=namespace,
                 subject_id=subject_id,
                 query=query,
                 run_id=run_id,
                 filters=filters,
-                limit=limit * 2,
+                limit=limit,
             )
-            bm25_items = self._filter_items_by_metadata(bm25_items, filters or {})
-            if items or bm25_items:
-                items = self._merge_hybrid_results(
-                    items,
-                    bm25_items,
-                    vector_weight=settings.MEM0_HYBRID_VECTOR_WEIGHT,
-                    bm25_weight=settings.MEM0_HYBRID_BM25_WEIGHT,
-                    limit=limit,
-                )
+            if lexical_min_score is not None:
+                bm25_items = [x for x in bm25_items if (x.get("score") or 0) >= lexical_min_score]
+            out_lex: List[Dict[str, Any]] = []
+            for it in bm25_items:
+                raw = float(it.get("score") or 0)
+                fus = Mem0Service._score_to_unit_interval(raw)
+                row = {
+                    **it,
+                    "fusion_score": fus,
+                    "vector_score": None,
+                    "lexical_score": raw,
+                    "match_sources": ["bm25"],
+                }
+                out_lex.append(self._finalize_search_item(row))
+            return {"items": out_lex}
 
-        return {"items": items}
+        vw, lw = self._resolve_fusion_weights(vector_weight, lexical_weight)
+        items_vec = await _vector_hits(limit, vector_min_score)
+        bm25_items = await self._search_bm25_in_db(
+            namespace=namespace,
+            subject_id=subject_id,
+            query=query,
+            run_id=run_id,
+            filters=filters,
+            limit=limit,
+        )
+        if lexical_min_score is not None:
+            bm25_items = [x for x in bm25_items if (x.get("score") or 0) >= lexical_min_score]
+
+        await user_service.touch_subject(namespace, subject_id)
+        if not items_vec and not bm25_items:
+            return {"items": []}
+        merged = self._merge_hybrid_results(items_vec, bm25_items, vw, lw, limit)
+        if min_fusion_score is not None:
+            merged = [x for x in merged if (x.get("fusion_score") or 0) >= min_fusion_score]
+        return {"items": merged}
 
     async def search_memories(
         self,
@@ -408,19 +507,29 @@ class Mem0Service:
         subject_id: str,
         query: str,
         limit: int = 5,
+        fusion: str = "hybrid",
+        vector_min_score: float = 0.5,
+        lexical_min_score: Optional[float] = None,
+        min_fusion_score: Optional[float] = None,
+        vector_weight: Optional[float] = None,
+        lexical_weight: Optional[float] = None,
         run_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
-        use_hybrid_search: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Search memories using semantic similarity, optionally with hybrid (vector+BM25)."""
+        """向量 / BM25 / 加权融合检索。"""
         result = await self.search_memories_scoped(
             namespace=namespace,
             subject_id=subject_id,
             query=query,
             limit=limit,
+            fusion=fusion,
+            vector_min_score=vector_min_score,
+            lexical_min_score=lexical_min_score,
+            min_fusion_score=min_fusion_score,
+            vector_weight=vector_weight,
+            lexical_weight=lexical_weight,
             run_id=run_id,
             filters=filters,
-            use_hybrid_search=use_hybrid_search,
         )
         return result["items"]
 

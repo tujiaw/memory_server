@@ -66,7 +66,13 @@ SCHEMA_STATEMENTS: List[str] = [
     "DROP INDEX IF EXISTS memory_lexical_bm25_idx",
     """
     CREATE INDEX memory_lexical_bm25_idx ON memory_lexical
-    USING bm25 (memory_id, content, namespace, subject_id, run_id)
+    USING bm25 (
+        memory_id,
+        (content::pdb.lindera('chinese')),
+        namespace,
+        subject_id,
+        run_id
+    )
     WITH (key_field='memory_id')
     """,
 ]

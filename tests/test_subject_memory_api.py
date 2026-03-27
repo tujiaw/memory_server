@@ -81,9 +81,21 @@ def test_add_memory_rejects_unauthorized_namespace():
 
 
 def test_search_memories_route_returns_items(monkeypatch):
+    captured = {}
+
     async def fake_search_memories_scoped(**kwargs):
+        captured.update(kwargs)
         return {
-            "items": [{"id": "m1", "text": "用户喜欢 Python", "score": 0.91}],
+            "items": [
+                {
+                    "id": "m1",
+                    "text": "用户喜欢 Python",
+                    "fusion_score": 0.91,
+                    "vector_score": 0.91,
+                    "lexical_score": None,
+                    "match_sources": ["vector"],
+                }
+            ],
         }
 
     monkeypatch.setattr(
@@ -108,6 +120,8 @@ def test_search_memories_route_returns_items(monkeypatch):
     assert response.status_code == 200
     data = response.json()
     assert data["count"] == 1
+    assert captured["fusion"] == "hybrid"
+    assert captured["vector_min_score"] == 0.5
 
 
 def test_get_all_memories_route_returns_items(monkeypatch):
@@ -189,7 +203,16 @@ class FakeMemoryClient:
             ]
         }
 
-    def search(self, query, user_id=None, agent_id=None, run_id=None, limit=5, filters=None):
+    def search(
+        self,
+        query,
+        user_id=None,
+        agent_id=None,
+        run_id=None,
+        limit=5,
+        filters=None,
+        threshold=None,
+    ):
         self.search_calls.append(
             {
                 "query": query,
@@ -198,6 +221,7 @@ class FakeMemoryClient:
                 "run_id": run_id,
                 "limit": limit,
                 "filters": filters,
+                "threshold": threshold,
             }
         )
         return {
@@ -291,6 +315,7 @@ async def test_mem0_service_search_passes_filters(monkeypatch):
         subject_id="subject-1",
         query="python",
         limit=3,
+        fusion="vector",
         run_id="session-1",
         filters={"category": "preference"},
     )
@@ -299,4 +324,5 @@ async def test_mem0_service_search_passes_filters(monkeypatch):
     assert fake_client.search_calls[0]["user_id"] == "subject-1"
     assert fake_client.search_calls[0]["run_id"] == "session-1"
     assert fake_client.search_calls[0]["filters"] == {"category": "preference"}
+    assert fake_client.search_calls[0]["threshold"] == 0.5
     assert results[0]["text"] == "prefers python"

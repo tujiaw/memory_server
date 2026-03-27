@@ -58,9 +58,14 @@ async def search_memories(
             subject_id=request.subject_id,
             query=request.query,
             limit=request.limit,
+            fusion=request.fusion,
+            vector_min_score=request.vector_min_score,
+            lexical_min_score=request.lexical_min_score,
+            min_fusion_score=request.min_fusion_score,
+            vector_weight=request.vector_weight,
+            lexical_weight=request.lexical_weight,
             run_id=request.run_id,
             filters=request.filters,
-            use_hybrid_search=request.use_hybrid_search,
         )
         return MemoryListResponse(
             success=True,
