@@ -147,11 +147,17 @@ async def health(response: Response):
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
+
+    # Uvicorn 会监视 cwd；Docker 挂载的 data/ 子目录可能不可读，导致 watchfiles 抛 PermissionError
+    if settings.DEBUG:
+        os.environ.setdefault("WATCHFILES_IGNORE_PERMISSION_DENIED", "1")
 
     uvicorn.run(
         "main:app",
         host=settings.HOST,
         port=settings.PORT,
         reload=settings.DEBUG,
+        reload_dirs=["app"] if settings.DEBUG else None,
     )

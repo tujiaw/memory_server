@@ -134,6 +134,8 @@ class Mem0Service:
             "created_at": Mem0Service._dt_to_api_str(result.get("created_at")),
             "updated_at": Mem0Service._dt_to_api_str(result.get("updated_at")),
         }
+        if "score" in result:
+            out["score"] = result["score"]
         if "fusion_score" in result:
             out["fusion_score"] = result["fusion_score"]
         if "vector_score" in result:
@@ -250,13 +252,10 @@ class Mem0Service:
 
         return deduplicated
 
-    def _resolve_fusion_weights(
-        self,
-        vector_weight: Optional[float],
-        lexical_weight: Optional[float],
-    ) -> tuple[float, float]:
-        vw = settings.MEM0_HYBRID_VECTOR_WEIGHT if vector_weight is None else vector_weight
-        lw = settings.MEM0_HYBRID_BM25_WEIGHT if lexical_weight is None else lexical_weight
+    @staticmethod
+    def _normalized_hybrid_weights() -> tuple[float, float]:
+        vw = settings.MEM0_HYBRID_VECTOR_WEIGHT
+        lw = settings.MEM0_HYBRID_BM25_WEIGHT
         total = vw + lw
         if total <= 0:
             return 0.7, 0.3
@@ -420,15 +419,13 @@ class Mem0Service:
         query: str,
         limit: int = 10,
         fusion: str = "hybrid",
-        vector_min_score: float = 0,
-        lexical_min_score: Optional[float] = None,
-        min_fusion_score: Optional[float] = None,
-        vector_weight: Optional[float] = None,
-        lexical_weight: Optional[float] = None,
         run_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         memory_client = self._get_memory_client()
+        vector_min_score = settings.MEM0_SEARCH_VECTOR_MIN_SCORE
+        lexical_min_score = settings.MEM0_SEARCH_LEXICAL_MIN_SCORE
+        min_fusion_score = settings.MEM0_SEARCH_MIN_FUSION_SCORE
 
         async def _vector_hits(search_limit: int, threshold: float) -> List[Dict[str, Any]]:
             payload = await asyncio.to_thread(
@@ -480,7 +477,7 @@ class Mem0Service:
                 out_lex.append(self._finalize_search_item(row))
             return {"items": out_lex}
 
-        vw, lw = self._resolve_fusion_weights(vector_weight, lexical_weight)
+        vw, lw = self._normalized_hybrid_weights()
         items_vec = await _vector_hits(limit, vector_min_score)
         bm25_items = await self._search_bm25_in_db(
             namespace=namespace,
@@ -508,11 +505,6 @@ class Mem0Service:
         query: str,
         limit: int = 10,
         fusion: str = "hybrid",
-        vector_min_score: float = 0.5,
-        lexical_min_score: Optional[float] = None,
-        min_fusion_score: Optional[float] = None,
-        vector_weight: Optional[float] = None,
-        lexical_weight: Optional[float] = None,
         run_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
@@ -523,11 +515,6 @@ class Mem0Service:
             query=query,
             limit=limit,
             fusion=fusion,
-            vector_min_score=vector_min_score,
-            lexical_min_score=lexical_min_score,
-            min_fusion_score=min_fusion_score,
-            vector_weight=vector_weight,
-            lexical_weight=lexical_weight,
             run_id=run_id,
             filters=filters,
         )

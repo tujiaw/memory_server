@@ -15,6 +15,7 @@ os.environ.setdefault(
     '{"svc-agent":{"secret":"top-secret","namespaces":["team-a"]}}',
 )
 
+from app.core.config import settings
 from app.api.mem0_routes import router as memory_router
 from app.api.user_routes import router as subject_router
 from app.services.auth_service import auth_service
@@ -121,7 +122,7 @@ def test_search_memories_route_returns_items(monkeypatch):
     data = response.json()
     assert data["count"] == 1
     assert captured["fusion"] == "hybrid"
-    assert captured["vector_min_score"] == 0.5
+    assert "vector_min_score" not in captured
 
 
 def test_get_all_memories_route_returns_items(monkeypatch):
@@ -324,5 +325,5 @@ async def test_mem0_service_search_passes_filters(monkeypatch):
     assert fake_client.search_calls[0]["user_id"] == "subject-1"
     assert fake_client.search_calls[0]["run_id"] == "session-1"
     assert fake_client.search_calls[0]["filters"] == {"category": "preference"}
-    assert fake_client.search_calls[0]["threshold"] == 0.5
+    assert fake_client.search_calls[0]["threshold"] == settings.MEM0_SEARCH_VECTOR_MIN_SCORE
     assert results[0]["text"] == "prefers python"
