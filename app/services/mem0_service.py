@@ -261,6 +261,14 @@ class Mem0Service:
             return 0.7, 0.3
         return vw / total, lw / total
 
+    @staticmethod
+    def _effective_run_id(run_id: Optional[str]) -> Optional[str]:
+        if run_id is None:
+            return None
+        if isinstance(run_id, str) and not run_id.strip():
+            return None
+        return run_id
+
     async def _persist_memory_lexical_batch(
         self,
         namespace: str,
@@ -423,6 +431,7 @@ class Mem0Service:
         filters: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         memory_client = self._get_memory_client()
+        run_id = self._effective_run_id(run_id)
         vector_min_score = settings.MEM0_SEARCH_VECTOR_MIN_SCORE
         lexical_min_score = settings.MEM0_SEARCH_LEXICAL_MIN_SCORE
         min_fusion_score = settings.MEM0_SEARCH_MIN_FUSION_SCORE
@@ -528,6 +537,7 @@ class Mem0Service:
         run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         memory_client = self._get_memory_client()
+        run_id = self._effective_run_id(run_id)
         results = await asyncio.to_thread(
             memory_client.get_all,
             user_id=subject_id,
