@@ -91,7 +91,6 @@ def test_search_memories_route_returns_items(monkeypatch):
                 {
                     "id": "m1",
                     "text": "用户喜欢 Python",
-                    "fusion_score": 0.91,
                     "vector_score": 0.91,
                     "lexical_score": None,
                     "match_sources": ["vector"],

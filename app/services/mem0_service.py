@@ -136,8 +136,6 @@ class Mem0Service:
         }
         if "score" in result:
             out["score"] = result["score"]
-        if "fusion_score" in result:
-            out["fusion_score"] = result["fusion_score"]
         if "vector_score" in result:
             out["vector_score"] = result["vector_score"]
         if "lexical_score" in result:
@@ -150,6 +148,7 @@ class Mem0Service:
     def _finalize_search_item(row: Dict[str, Any]) -> Dict[str, Any]:
         row = {k: v for k, v in row.items() if k != "_norm_score"}
         row.pop("score", None)
+        row.pop("_hybrid_fusion", None)
         return Mem0Service._normalize_memory_result(row)
 
     def _normalize_results(self, payload: Any) -> List[Dict[str, Any]]:
@@ -224,14 +223,14 @@ class Mem0Service:
             merged.append(
                 {
                     **base,
-                    "fusion_score": fusion,
+                    "_hybrid_fusion": fusion,
                     "vector_score": v_raw,
                     "lexical_score": b_raw,
                     "match_sources": match_sources,
                 }
             )
-        merged.sort(key=lambda x: x.get("fusion_score") or 0.0, reverse=True)
-        return [Mem0Service._finalize_search_item(m) for m in merged[:limit]]
+        merged.sort(key=lambda x: x.get("_hybrid_fusion") or 0.0, reverse=True)
+        return merged[:limit]
 
     @staticmethod
     def _deduplicate_memory_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -456,7 +455,7 @@ class Mem0Service:
             for it in items_raw:
                 vs = it.get("score")
                 vf = float(vs) if vs is not None else None
-                row = {**it, "fusion_score": vf, "vector_score": vf, "lexical_score": None, "match_sources": ["vector"]}
+                row = {**it, "vector_score": vf, "lexical_score": None, "match_sources": ["vector"]}
                 out.append(self._finalize_search_item(row))
             return {"items": out}
 
@@ -475,10 +474,8 @@ class Mem0Service:
             out_lex: List[Dict[str, Any]] = []
             for it in bm25_items:
                 raw = float(it.get("score") or 0)
-                fus = Mem0Service._score_to_unit_interval(raw)
                 row = {
                     **it,
-                    "fusion_score": fus,
                     "vector_score": None,
                     "lexical_score": raw,
                     "match_sources": ["bm25"],
@@ -504,8 +501,8 @@ class Mem0Service:
             return {"items": []}
         merged = self._merge_hybrid_results(items_vec, bm25_items, vw, lw, limit)
         if min_fusion_score is not None:
-            merged = [x for x in merged if (x.get("fusion_score") or 0) >= min_fusion_score]
-        return {"items": merged}
+            merged = [x for x in merged if (x.get("_hybrid_fusion") or 0) >= min_fusion_score]
+        return {"items": [self._finalize_search_item(m) for m in merged]}
 
     async def search_memories(
         self,
