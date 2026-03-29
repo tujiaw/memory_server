@@ -1,35 +1,43 @@
 version: "3.8"
 
-# 数据持久化：默认写入项目旁 ./data/，可通过环境变量 DATA_DIR 指向外挂盘，例如：
-#   DATA_DIR=/mnt/ssd/memory-server-data docker compose up -d
-# 首次启动前建议：mkdir -p "$DATA_DIR/qdrant" "$DATA_DIR/paradedb"
+# 数据目录：DATA_DIR 默认可为 ./data，需 elasticsearch、postgres 子目录
+#   mkdir -p "$DATA_DIR/elasticsearch" "$DATA_DIR/postgres"
 
 services:
-  qdrant:
-    image: qdrant/qdrant:v1.12.0
-    container_name: memory-qdrant
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: memory-elasticsearch
     ports:
-      - "6333:6333"   # HTTP API
-      - "6334:6334"   # gRPC API
+      - "9200:9200"
     volumes:
-      - ${DATA_DIR:-./data}/qdrant:/qdrant/storage
+      - ${DATA_DIR:-./data}/elasticsearch:/usr/share/elasticsearch/data
     environment:
-      - QDRANT__LOG_LEVEL=DEBUG
-    command: ./qdrant --config-path /qdrant/config/production.yaml
+      - node.name=es01
+      - cluster.name=memory-cluster
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=changeme
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s -u elastic:changeme http://localhost:9200/_cluster/health | grep -q '\"status\"'",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
 
-  paradedb:
-    image: paradedb/paradedb:latest-pg16
-    container_name: memory-paradedb
+  postgres:
+    image: postgres:16-alpine
+    container_name: memory-postgres
     ports:
-      - "5433:5432"   # 避免与宿主机已有 PostgreSQL 占用 5432
+      - "5433:5432"
     volumes:
-      - ${DATA_DIR:-./data}/paradedb:/var/lib/postgresql/data
+      - ${DATA_DIR:-./data}/postgres:/var/lib/postgresql/data
     environment:
       POSTGRES_USER: memory
       POSTGRES_PASSWORD: memory
@@ -50,12 +58,14 @@ services:
       - .env
     environment:
       - PORT=8899
-      - QDRANT_HOST=qdrant
-      - QDRANT_PORT=6333
-      - DATABASE_URL=postgresql://memory:memory@paradedb:5432/memory_server
+      - ELASTICSEARCH_HOST=elasticsearch
+      - ELASTICSEARCH_PORT=9200
+      - ELASTICSEARCH_USER=elastic
+      - ELASTICSEARCH_PASSWORD=changeme
+      - DATABASE_URL=postgresql://memory:memory@postgres:5432/memory_server
     depends_on:
-      qdrant:
+      elasticsearch:
         condition: service_healthy
-      paradedb:
+      postgres:
         condition: service_healthy
     restart: unless-stopped

@@ -42,15 +42,15 @@ class Settings(BaseSettings):
     PORT: int = 8899
 
     DATABASE_URL: str = "postgresql://memory:memory@localhost:5433/memory_server"
-    # asyncpg 默认会尝试 SSL；本地 Docker/ParadeDB 多为明文，需显式关闭，否则握手阶段可能被 RST
     DATABASE_SSL: bool = False
 
-    # Qdrant
-    QDRANT_HOST: str = "localhost"
-    QDRANT_PORT: int = 6333
-    QDRANT_GRPC_PORT: int = 6334
-    QDRANT_API_KEY: str = ""
-    QDRANT_MEM0_COLLECTION: str = "mem0_global_memory"
+    # Elasticsearch（mem0 向量 + 全文 BM25 共用索引；阿里云 ES 将 host 设为 https:// 域名）
+    ELASTICSEARCH_HOST: str = "localhost"
+    ELASTICSEARCH_PORT: int = 9200
+    ELASTICSEARCH_USER: str = "elastic"
+    ELASTICSEARCH_PASSWORD: str = "changeme"
+    ELASTICSEARCH_INDEX: str = "mem0_memory"
+    ELASTICSEARCH_VERIFY_CERTS: bool = False
     VECTOR_SIZE: int = 1536
 
     # OpenAI Configuration
@@ -74,12 +74,6 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 24 * 60 # 24 hours
     ADMIN_API_TOKEN: str = "123456"
     SERVICE_CLIENTS_JSON: str = "{}"
-
-    @property
-    def qdrant_url(self) -> str:
-        if self.QDRANT_API_KEY:
-            return f"https://{self.QDRANT_HOST}:{self.QDRANT_PORT}"
-        return f"http://{self.QDRANT_HOST}:{self.QDRANT_PORT}"
 
     @property
     def service_clients(self) -> Dict[str, Dict[str, Any]]:

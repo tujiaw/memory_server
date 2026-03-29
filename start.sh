@@ -13,7 +13,7 @@ echo "====================================="
 if [ ! -f ".env" ]; then
     echo ".env 不存在，正在从 .env.example 创建..."
     cp .env.example .env
-    echo "请先填写 .env 中的 DATABASE_URL、OPENAI_API_KEY、SECRET_KEY 和 SERVICE_CLIENTS_JSON 后再重试。"
+    echo "请先填写 .env 中的 DATABASE_URL、ELASTICSEARCH_*（与 compose 中 ES 密码一致）、OPENAI_API_KEY、SECRET_KEY、SERVICE_CLIENTS_JSON 后再重试。"
     exit 1
 fi
 
@@ -46,9 +46,9 @@ if [ -z "$DR" ] && [ -f .env ]; then
   DR=$(grep -E '^[[:space:]]*DATA_DIR=' .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r' | sed "s/^['\"]//;s/['\"]$//")
 fi
 DR="${DR:-./data}"
-mkdir -p "$DR/qdrant" "$DR/paradedb"
+mkdir -p "$DR/elasticsearch" "$DR/postgres"
 export DATA_DIR="$DR"
-docker-compose up -d qdrant paradedb
+docker-compose up -d elasticsearch postgres
 
 echo "等待依赖服务就绪..."
 sleep 3

@@ -1,4 +1,3 @@
-import json
 import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -6,8 +5,7 @@ from typing import Any, Dict, List, Optional
 from mem0 import Memory
 
 from app.core.config import settings
-from app.database import postgres as pg_database
-from app.database.sql import MEMORY_LEXICAL_DELETE, MEMORY_LEXICAL_UPDATE, MEMORY_LEXICAL_UPSERT
+from app.database.es_memory import make_elasticsearch_client, search_bm25_lexical
 from app.services.user_service import user_service
 
 
@@ -19,15 +17,19 @@ class Mem0Service:
 
     @staticmethod
     def _get_global_config() -> dict:
-        """单集合向量库 + LLM；不包含 graph_store，知识图谱检索保持关闭。"""
+        """单索引 Elasticsearch：dense_vector（mem0）+ metadata.data（BM25）；graph 关闭。"""
         return {
             "vector_store": {
-                "provider": "qdrant",
+                "provider": "elasticsearch",
                 "config": {
-                    "collection_name": settings.QDRANT_MEM0_COLLECTION,
-                    "host": settings.QDRANT_HOST,
-                    "port": settings.QDRANT_PORT,
+                    "collection_name": settings.ELASTICSEARCH_INDEX,
+                    "host": settings.ELASTICSEARCH_HOST,
+                    "port": settings.ELASTICSEARCH_PORT,
+                    "user": settings.ELASTICSEARCH_USER,
+                    "password": settings.ELASTICSEARCH_PASSWORD,
                     "embedding_model_dims": settings.VECTOR_SIZE,
+                    "verify_certs": settings.ELASTICSEARCH_VERIFY_CERTS,
+                    "auto_create_index": False,
                 },
             },
             "llm": {
@@ -268,61 +270,7 @@ class Mem0Service:
             return None
         return run_id
 
-    async def _persist_memory_lexical_batch(
-        self,
-        namespace: str,
-        subject_id: str,
-        run_id: Optional[str],
-        items: List[Dict[str, Any]],
-    ) -> None:
-        if pg_database.postgres_db.pool is None:
-            return
-        now = datetime.now(timezone.utc)
-        for item in items:
-            mid = item.get("id")
-            if mid is None:
-                continue
-            text = (item.get("text") or "").strip()
-            if not text:
-                continue
-            meta = item.get("metadata") or {}
-
-            def _coerce_dt(value: Any) -> datetime:
-                if isinstance(value, datetime):
-                    return value
-                if isinstance(value, str):
-                    try:
-                        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-                    except ValueError:
-                        return now
-                return now
-
-            ca = _coerce_dt(item.get("created_at"))
-            ua = _coerce_dt(item.get("updated_at"))
-            await pg_database.postgres_db.execute(
-                MEMORY_LEXICAL_UPSERT,
-                str(mid),
-                namespace,
-                subject_id,
-                run_id,
-                text,
-                json.dumps(meta),
-                ca,
-                ua,
-            )
-
-    async def _delete_memory_lexical(self, memory_id: str) -> None:
-        if pg_database.postgres_db.pool is None:
-            return
-        await pg_database.postgres_db.execute(MEMORY_LEXICAL_DELETE, memory_id)
-
-    async def _update_memory_lexical(self, memory_id: str, content: str) -> None:
-        if pg_database.postgres_db.pool is None:
-            return
-        now = datetime.now(timezone.utc)
-        await pg_database.postgres_db.execute(MEMORY_LEXICAL_UPDATE, memory_id, content, now)
-
-    async def _search_bm25_in_db(
+    async def _search_bm25_elasticsearch(
         self,
         namespace: str,
         subject_id: str,
@@ -331,55 +279,23 @@ class Mem0Service:
         filters: Optional[Dict[str, Any]],
         limit: int,
     ) -> List[Dict[str, Any]]:
-        if pg_database.postgres_db.pool is None or not query.strip():
+        if not query.strip():
             return []
-        conditions = ["namespace = $1", "subject_id = $2"]
-        args: List[Any] = [namespace, subject_id]
-        n = 3
-        if run_id is not None:
-            conditions.append(f"run_id = ${n}")
-            args.append(run_id)
-            n += 1
-        if filters:
-            conditions.append(f"metadata @> ${n}::jsonb")
-            args.append(json.dumps(filters))
-            n += 1
-        # Lindera 中文分词索引 + 词项按 OR 匹配（与默认 @@@ 字符串的 AND 语义不同，避免「今天的天气」因文档无「的」而零命中）
-        conditions.append(
-            f"content @@@ paradedb.match('content', ${n}, conjunction_mode => false)"
-        )
-        args.append(query)
-        n += 1
-        sql = f"""
-        SELECT memory_id, content, metadata, namespace, subject_id, run_id, created_at, updated_at,
-               paradedb.score(memory_id) AS bm25_score
-        FROM memory_lexical
-        WHERE {" AND ".join(conditions)}
-        ORDER BY paradedb.score(memory_id) DESC NULLS LAST
-        LIMIT ${n}
-        """
-        args.append(limit)
-        rows = await pg_database.postgres_db.fetch(sql, *args)
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            meta = r["metadata"]
-            if isinstance(meta, str):
-                meta = json.loads(meta)
-            score = r["bm25_score"]
-            out.append(
-                {
-                    "id": r["memory_id"],
-                    "text": r["content"],
-                    "metadata": meta,
-                    "score": float(score) if score is not None else 0.0,
-                    "namespace": r["namespace"],
-                    "subject_id": r["subject_id"],
-                    "run_id": r["run_id"],
-                    "created_at": r["created_at"],
-                    "updated_at": r["updated_at"],
-                }
+
+        def run() -> List[Dict[str, Any]]:
+            client = make_elasticsearch_client()
+            return search_bm25_lexical(
+                client,
+                settings.ELASTICSEARCH_INDEX,
+                namespace,
+                subject_id,
+                query,
+                run_id,
+                filters,
+                limit,
             )
-        return out
+
+        return await asyncio.to_thread(run)
 
     async def add_memory(
         self,
@@ -404,11 +320,6 @@ class Mem0Service:
         )
         normalized_results = self._normalize_results(result)
         await self._track_successful_write(namespace, subject_id, len(normalized_results))
-        scoped = [
-            {**item, "namespace": namespace, "subject_id": subject_id, "run_id": run_id}
-            for item in normalized_results
-        ]
-        await self._persist_memory_lexical_batch(namespace, subject_id, run_id, scoped)
         if normalized_results:
             return normalized_results[0]
         return {
@@ -461,7 +372,7 @@ class Mem0Service:
 
         if mode == "bm25":
             await user_service.touch_subject(namespace, subject_id)
-            bm25_items = await self._search_bm25_in_db(
+            bm25_items = await self._search_bm25_elasticsearch(
                 namespace=namespace,
                 subject_id=subject_id,
                 query=query,
@@ -485,7 +396,7 @@ class Mem0Service:
 
         vw, lw = self._normalized_hybrid_weights()
         items_vec = await _vector_hits(limit, vector_min_score)
-        bm25_items = await self._search_bm25_in_db(
+        bm25_items = await self._search_bm25_elasticsearch(
             namespace=namespace,
             subject_id=subject_id,
             query=query,
@@ -575,7 +486,6 @@ class Mem0Service:
             data=content,
         )
         await user_service.touch_subject(namespace, subject_id)
-        await self._update_memory_lexical(str(memory_id), content)
         return {
             "id": memory_id,
             "text": content,
@@ -593,7 +503,6 @@ class Mem0Service:
         memory_client = self._get_memory_client()
         await asyncio.to_thread(memory_client.delete, memory_id=memory_id)
         await user_service.touch_subject(namespace, subject_id)
-        await self._delete_memory_lexical(str(memory_id))
         return True
 
     async def add_memories_batch(
@@ -658,11 +567,6 @@ class Mem0Service:
         )
         normalized_results = self._normalize_results(result)
         await self._track_successful_write(namespace, subject_id, len(normalized_results))
-        scoped = [
-            {**item, "namespace": namespace, "subject_id": subject_id, "run_id": run_id}
-            for item in normalized_results
-        ]
-        await self._persist_memory_lexical_batch(namespace, subject_id, run_id, scoped)
         return {
             "items": normalized_results,
             "count": len(normalized_results),
@@ -698,7 +602,7 @@ class Mem0Service:
                 "namespace": namespace,
                 "subject_id": subject_id,
                 "total_memories": 0,
-                "collection_name": settings.QDRANT_MEM0_COLLECTION,
+                "collection_name": settings.ELASTICSEARCH_INDEX,
             }
         all_memories = await self.get_all_memories(namespace=namespace, subject_id=subject_id)
         return {
@@ -707,7 +611,7 @@ class Mem0Service:
             "name": subject_stats.get("name"),
             "email": subject_stats.get("email"),
             "total_memories": len(all_memories),
-            "collection_name": settings.QDRANT_MEM0_COLLECTION,
+            "collection_name": settings.ELASTICSEARCH_INDEX,
             "created_at": subject_stats.get("created_at"),
             "last_active": subject_stats.get("last_active"),
         }

@@ -85,38 +85,6 @@ SCHEMA_STATEMENTS: List[str] = [
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     """,
-    """
-    CREATE TABLE IF NOT EXISTS memory_lexical (
-        memory_id TEXT NOT NULL PRIMARY KEY,
-        namespace TEXT NOT NULL,
-        subject_id TEXT NOT NULL,
-        run_id TEXT,
-        content TEXT NOT NULL,
-        metadata JSONB NOT NULL DEFAULT '{}',
-        created_at TIMESTAMPTZ,
-        updated_at TIMESTAMPTZ
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS memory_lexical_ns_subj_run
-    ON memory_lexical (namespace, subject_id, run_id)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS memory_lexical_metadata_gin
-    ON memory_lexical USING gin (metadata jsonb_path_ops)
-    """,
-    "DROP INDEX IF EXISTS memory_lexical_bm25_idx",
-    """
-    CREATE INDEX memory_lexical_bm25_idx ON memory_lexical
-    USING bm25 (
-        memory_id,
-        (content::pdb.lindera('chinese')),
-        namespace,
-        subject_id,
-        run_id
-    )
-    WITH (key_field='memory_id')
-    """,
 ]
 
 

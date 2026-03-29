@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Memory Server 项目大纲
 
-这是一个基于 `FastAPI` 的后端 API 服务，核心能力是 `JWT 鉴权 + MongoDB 用户资料 + mem0/Qdrant 语义记忆管理`。
+这是一个基于 `FastAPI` 的后端 API 服务，核心能力是 `JWT 鉴权 + PostgreSQL（主体与客户端等关系数据）+ mem0/Elasticsearch（向量与 BM25 共用索引）`。
 
 ## 项目目标
 
@@ -15,16 +15,16 @@ alwaysApply: true
 
 ## 入口与运行
 
-- `main.py` 是应用入口，负责创建 `FastAPI` 应用、注册路由、配置 CORS，并在生命周期里连接/断开 `MongoDB`。
-- `start.sh` 是本地启动脚本，会准备 `.env`、启动 `Qdrant` 与 `MongoDB`、安装依赖并启动服务。
-- `requirements.txt` 体现核心技术栈：`FastAPI`、`mem0`、`Qdrant`、`MongoDB`、`OpenAI`、`JWT`。
+- `main.py` 是应用入口，负责创建 `FastAPI` 应用、注册路由、配置 CORS，并在生命周期里连接 `PostgreSQL`、确保 Elasticsearch 记忆索引存在。
+- `start.sh` 会准备 `.env`、启动 `Elasticsearch` 与 `PostgreSQL` 容器、安装依赖并启动服务。
+- `requirements.txt` 体现核心技术栈：`FastAPI`、`mem0`、`elasticsearch`、`PostgreSQL（asyncpg）`、`OpenAI`、`JWT`。
 
 ## 目录职责
 
 - `app/api/`：HTTP 路由层，负责参数接收、响应格式和状态码映射，不承载核心业务。
 - `app/services/`：业务逻辑层，处理认证、用户、记忆等核心流程。
 - `app/core/`：全局配置与依赖注入，包含环境变量配置和当前用户认证依赖。
-- `app/database/`：数据库连接与集合访问封装。
+- `app/database/`：`postgres.py`（连接池与 schema）、`es_memory.py`（索引与 BM25 查询）、`sql.py`。
 - `app/models/`：Pydantic 请求/响应模型，主要用于接口 schema，而不是 ORM 实体。
 
 ## 业务主线
@@ -37,10 +37,10 @@ alwaysApply: true
 
 - 调整接口行为时，优先沿着 `route -> service -> database/config` 的路径追踪。
 - 涉及鉴权或 token 时，先看认证链路，而不是直接在业务路由里加判断。
-- 涉及用户资料持久化时，优先查看 `user_service` 与 `MongoDB` 封装。
-- 涉及语义记忆、检索、批量写入、会话抽取时，优先查看 `mem0_service`。
+- 涉及用户资料持久化时，优先查看 `user_service` 与 `PostgreSQL` 封装。
+- 涉及语义记忆、检索、批量写入、会话抽取时，优先查看 `mem0_service` 与 `es_memory.py`。
 
 ## 示例
 
 - 例：要修改 JWT 认证行为，先检查 `app/services/auth_service.py` 的 token 生成/校验，再看 `app/core/deps.py` 如何把 token 解析为当前用户。
-- 例：要修改“创建用户”接口，先看 `app/api/user_routes.py` 的请求/响应，再看 `app/services/user_service.py` 的持久化逻辑。
+- 例：要修改记忆检索或 BM25 行为，先看 `app/services/mem0_service.py`，再看 `app/database/es_memory.py` 与 mem0 的 Elasticsearch 配置。

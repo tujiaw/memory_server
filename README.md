@@ -1,6 +1,6 @@
 # Memory Server
 
-面向公司内部团队的 Memory API 服务。在开源 **mem0** 之上做了一层稳定、易集成的 **FastAPI** 封装：向量语义检索走 **Qdrant**，词面（BM25）检索与主体画像、服务凭证等关系数据走 **PostgreSQL（ParadeDB 兼容镜像）**。调用方用 **namespace + subject_id** 隔离数据，用服务 JWT 做鉴权。
+面向公司内部团队的 Memory API 服务。在开源 **mem0** 之上用 **FastAPI** 封装：**向量与全文 BM25 共用同一 Elasticsearch 索引**（`dense_vector` + `metadata.data`）；**主体画像、服务客户端、令牌**等关系数据在 **PostgreSQL**。调用方用 **namespace + subject_id** 隔离数据，用服务 JWT 做鉴权。
 
 ## 能力概览
 
@@ -13,21 +13,20 @@
 | 检索 | `mode`: **`hybrid`**（向量+BM25 加权融合）、**`vector`**、**`bm25`**（纯 BM25） |
 | 主体画像 | Subject Context 写入/读取，用于增强 mem0 写入时的上下文 |
 | 统计 | 按主体的记忆统计接口 |
-| 健康检查 | `/health` 探测 PostgreSQL、Qdrant、OpenAI 配置 |
+| 健康检查 | `/health` 探测 PostgreSQL、Elasticsearch、OpenAI 配置 |
 
 ## 技术栈
 
 - **API**: FastAPI、Pydantic v2  
-- **Memory / 向量**: mem0、Qdrant  
-- **词面索引**: ParadeDB BM25（`memory_lexical` 表，中文 Lindera 分词）  
-- **关系与配置库**: PostgreSQL（推荐 `paradedb/paradedb` 镜像；asyncpg）  
+- **Memory / 向量 / BM25**: mem0、**Elasticsearch**（单索引：kNN + `multi_match` 全文）  
+- **关系与配置库**: PostgreSQL（`postgres:16` 或云 RDS；asyncpg）  
 - **LLM / Embedding**: OpenAI 兼容 API（`OPENAI_BASE_URL` + Key）  
 - **鉴权**: JWT（python-jose）、bcrypt 客户端密钥  
 
 ## 架构要点
 
-1. **向量记忆**：mem0 将记忆写入 Qdrant（集合名等由 `QDRANT_*` 与 mem0 配置决定）。  
-2. **词面记忆**：成功写入向量侧后，服务会把文本同步到 `memory_lexical`，供 **`mode=bm25`** 或 hybrid 中的 BM25 一路使用。**若 PostgreSQL 未连接，词面表不会更新，bm25/hybrid 的词面结果会缺失。**  
+1. **向量 + 正文**：mem0 使用 **Elasticsearch** 向量存储；文档 `_source` 含 `vector` 与 `metadata`（其中 `data` 为记忆正文）。  
+2. **BM25**：`mode=bm25` 与 hybrid 中的词面一路对 **`metadata.data`** 做 `multi_match`（标准分析器），与向量共用同一索引；**Elasticsearch 不可用则检索失败。**  
 3. **检索分数**：响应中提供 **`vector_score`**、**`lexical_score`**（BM25 原始分）与 **`match_sources`**（`vector` / `bm25`）。混合排序由服务端内部加权完成，不对外返回融合分。  
 4. **`run_id`**：请求里若传 **空字符串** `""`，服务会视为「未限定 run」，与库中 `run_id IS NULL` 的行一致；避免误写成 `run_id = ''` 导致零结果。  
 5. **检索调参**：向量阈值、BM25 下限、混合融合过滤、hybrid 权重等通过环境变量 **`MEM0_SEARCH_*` / `MEM0_HYBRID_*`** 配置，**不在**搜索请求体中暴露。
@@ -43,17 +42,17 @@ cp .env.example .env
 ./start.sh
 ```
 
-脚本会：创建/使用 `venv`、安装依赖、启动 **qdrant** 与 **paradedb** 容器，然后执行 `python main.py`（`DEBUG=True` 时带热重载）。
+脚本会：创建/使用 `venv`、安装依赖、启动 **elasticsearch** 与 **postgres** 容器，然后执行 `python main.py`（`DEBUG=True` 时带热重载）。默认 ES 用户 `elastic` / 密码与 `docker-compose` 中 `ELASTIC_PASSWORD`（示例 `changeme`）及 `.env` 中 `ELASTICSEARCH_PASSWORD` 一致。
 
 ### 方式二：Docker Compose（含 API 容器）
 
 ```bash
 cp .env.example .env
-# 容器内已指向 compose 网络中的 qdrant / paradedb，可覆盖 .env 中的 DATABASE_URL、QDRANT_HOST 等
+# 容器内已设置 ELASTICSEARCH_HOST=elasticsearch、DATABASE_URL 等，可按需在 .env 覆盖
 docker compose up --build
 ```
 
-数据目录默认 `./data`（`qdrant`、`paradedb` 子目录）；可通过环境变量 **`DATA_DIR`** 指向外挂盘。
+数据目录默认 `./data`（`elasticsearch`、`postgres` 子目录）；可通过 **`DATA_DIR`** 指向外挂盘。
 
 ### 访问地址
 
@@ -72,12 +71,13 @@ docker compose up --build
 
 **数据库（全功能建议始终配置）**
 
-- `DATABASE_URL`：默认指向本机 `localhost:5433` 的 ParadeDB（与 `docker-compose` 端口映射一致）  
+- `DATABASE_URL`：默认本机 `localhost:5433`（与 compose 中 postgres 映射一致）  
 - `DATABASE_SSL`：本地一般为 `false`  
 
-**Qdrant**
+**Elasticsearch（与 mem0 共用索引）**
 
-- `QDRANT_HOST`、`QDRANT_PORT`、`QDRANT_MEM0_COLLECTION`、`VECTOR_SIZE` 等  
+- `ELASTICSEARCH_HOST`、`ELASTICSEARCH_PORT`、`ELASTICSEARCH_USER`、`ELASTICSEARCH_PASSWORD`  
+- `ELASTICSEARCH_INDEX`（默认 `mem0_memory`）、`VECTOR_SIZE`、`ELASTICSEARCH_VERIFY_CERTS`（本地 Docker 多为 `false`；阿里云 ES 多为 `https` + `true`）  
 
 **内部客户端（回退/冷启动）**
 
@@ -183,10 +183,10 @@ main.py                 # FastAPI 应用、生命周期、CORS、健康检查
 app/
   api/                  # auth_routes, mem0_routes, user_routes, admin_routes
   core/                 # config.py, deps.py（JWT、namespace、Admin）
-  database/             # postgres.py（连接池、迁移 SQL）、sql.py
+  database/             # postgres.py、es_memory.py（索引与 BM25 查询）、sql.py
   models/               # Pydantic schemas
   services/             # auth_service, mem0_service, user_service
-docker-compose.yml      # qdrant、paradedb、api
+docker-compose.yml      # elasticsearch、postgres、api
 start.sh                # 本地依赖容器 + venv + main.py
 tests/                  # pytest
 ```
@@ -199,4 +199,4 @@ tests/                  # pytest
 
 ---
 
-若你来自旧文档：本项目**不再使用 MongoDB**；主体与服务客户端等均已落在 **PostgreSQL（ParadeDB）** 中，与 **Qdrant + mem0** 共同构成完整记忆链路。
+主体与服务客户端等在 **PostgreSQL**；记忆向量与 BM25 全文在 **Elasticsearch**，由 **mem0** 与应用层混合检索共同使用。

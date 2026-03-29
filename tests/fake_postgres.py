@@ -1,4 +1,4 @@
-"""In-memory PostgreSQL stub for admin/auth tests (no ParadeDB required)."""
+"""In-memory PostgreSQL stub for admin/auth tests (no real Postgres required)."""
 
 from __future__ import annotations
 

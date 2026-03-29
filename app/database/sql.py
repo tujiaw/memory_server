@@ -71,24 +71,3 @@ SERVICE_TOKEN_SELECT = """
 SELECT token_hash, service_id, namespaces, expires_at, is_active
 FROM service_tokens WHERE token_hash = $1
 """
-
-MEMORY_LEXICAL_UPSERT = """
-INSERT INTO memory_lexical (memory_id, namespace, subject_id, run_id, content, metadata, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
-ON CONFLICT (memory_id) DO UPDATE SET
-    namespace = EXCLUDED.namespace,
-    subject_id = EXCLUDED.subject_id,
-    run_id = EXCLUDED.run_id,
-    content = EXCLUDED.content,
-    metadata = EXCLUDED.metadata,
-    updated_at = EXCLUDED.updated_at
-"""
-
-MEMORY_LEXICAL_UPDATE = """
-UPDATE memory_lexical SET content = $2, updated_at = $3
-WHERE memory_id = $1
-"""
-
-MEMORY_LEXICAL_DELETE = """
-DELETE FROM memory_lexical WHERE memory_id = $1
-"""

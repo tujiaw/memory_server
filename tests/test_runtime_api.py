@@ -27,6 +27,8 @@ def client(monkeypatch):
 
     monkeypatch.setattr(pgmod.postgres_db, "connect", fake_connect)
     monkeypatch.setattr(pgmod.postgres_db, "disconnect", fake_disconnect)
+    monkeypatch.setattr(main, "make_elasticsearch_client", lambda: None)
+    monkeypatch.setattr(main, "ensure_mem0_index", lambda *args, **kwargs: None)
     return TestClient(main.app)
 
 
@@ -45,7 +47,7 @@ def test_health_returns_503_when_dependency_is_unhealthy(client, monkeypatch):
             "status": "degraded",
             "services": {
                 "postgresql": "healthy",
-                "qdrant": "unhealthy",
+                "elasticsearch": "unhealthy",
                 "openai_config": "healthy",
             },
         }

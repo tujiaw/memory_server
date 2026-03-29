@@ -5,7 +5,6 @@ from typing import Any, Dict
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from qdrant_client import QdrantClient
 
 from app.api.admin_routes import router as admin_router
 from app.core.config import settings
@@ -13,6 +12,7 @@ from app.api.auth_routes import router as auth_router
 from app.api.mem0_routes import router as memories_router
 from app.api.user_routes import router as users_router
 from app.database import postgres as pg_database
+from app.database.es_memory import cluster_health_snippet, ensure_mem0_index, make_elasticsearch_client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,10 +40,12 @@ def build_error_response(
 async def lifespan(app: FastAPI):
     """Manage application lifespan events."""
     print(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
-    print(f"Qdrant: {settings.QDRANT_HOST}:{settings.QDRANT_PORT}")
+    print(f"Elasticsearch: {settings.ELASTICSEARCH_HOST}:{settings.ELASTICSEARCH_PORT} index={settings.ELASTICSEARCH_INDEX}")
     print(f"PostgreSQL: {settings.DATABASE_URL.split('@')[-1] if '@' in settings.DATABASE_URL else settings.DATABASE_URL}")
     print(f"OpenAI: {settings.OPENAI_MODEL} + {settings.OPENAI_EMBEDDING_MODEL}")
     await pg_database.postgres_db.connect()
+    es = make_elasticsearch_client()
+    ensure_mem0_index(es, settings.ELASTICSEARCH_INDEX, settings.VECTOR_SIZE)
     yield
     print("Shutting down...")
     await pg_database.postgres_db.disconnect()
@@ -52,7 +54,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    description="Internal Memory MVP API powered by FastAPI + mem0 + Qdrant + ParadeDB",
+    description="Internal Memory MVP API: FastAPI + mem0 + Elasticsearch (vector + BM25) + PostgreSQL",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
@@ -109,7 +111,7 @@ app.include_router(admin_router, prefix="/api/v1")
 async def collect_health_status() -> Dict[str, Any]:
     services: Dict[str, str] = {
         "postgresql": "healthy",
-        "qdrant": "healthy",
+        "elasticsearch": "healthy",
         "openai_config": "healthy",
     }
 
@@ -121,14 +123,12 @@ async def collect_health_status() -> Dict[str, Any]:
         services["postgresql"] = "unhealthy"
 
     try:
-        qdrant_client = QdrantClient(
-            host=settings.QDRANT_HOST,
-            port=settings.QDRANT_PORT,
-            api_key=settings.QDRANT_API_KEY or None,
-        )
-        qdrant_client.get_collections()
+        es = make_elasticsearch_client()
+        status = cluster_health_snippet(es)
+        if status not in ("green", "yellow"):
+            raise RuntimeError(f"Elasticsearch cluster status: {status}")
     except Exception:
-        services["qdrant"] = "unhealthy"
+        services["elasticsearch"] = "unhealthy"
 
     if not settings.OPENAI_API_KEY or not settings.OPENAI_BASE_URL:
         services["openai_config"] = "unhealthy"
