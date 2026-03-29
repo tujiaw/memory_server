@@ -1,4 +1,6 @@
+import logging
 import secrets
+
 from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Annotated, Optional
@@ -6,6 +8,8 @@ from typing import Annotated, Optional
 from app.core.config import settings
 from app.models.schemas import AuthContext
 from app.services.auth_service import auth_service
+
+logger = logging.getLogger(__name__)
 
 security = HTTPBearer(auto_error=False)
 
@@ -52,6 +56,7 @@ async def require_admin_token(
         )
 
     if not secrets.compare_digest(admin_token, settings.ADMIN_API_TOKEN):
+        logger.warning("Admin API: invalid X-Admin-Token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid admin token",
@@ -64,6 +69,12 @@ def authorize_namespace(auth_context: AuthContext, namespace: str) -> None:
         return
 
     if namespace not in auth_context.namespaces:
+        logger.warning(
+            "Namespace denied: service_id=%s requested_namespace=%s allowed=%s",
+            auth_context.service_id,
+            namespace,
+            auth_context.namespaces,
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Service '{auth_context.service_id}' cannot access namespace '{namespace}'",

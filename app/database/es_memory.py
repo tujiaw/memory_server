@@ -32,6 +32,11 @@ def make_elasticsearch_client() -> Elasticsearch:
 def ensure_mem0_index(client: Elasticsearch, index_name: str, vector_dims: int) -> None:
     """在 mem0 首次写入前创建索引；mapping 含 vector + metadata.data（BM25）。"""
     if client.indices.exists(index=index_name):
+        logger.info(
+            "Elasticsearch index %s already exists; skipping create. "
+            "If BM25/kNN misbehaves, delete the index so the app can recreate mapping.",
+            index_name,
+        )
         return
     body: Dict[str, Any] = {
         "settings": {
@@ -89,10 +94,18 @@ def _filter_clauses(
         for key, value in filters.items():
             if value is None:
                 continue
-            if isinstance(value, (str, int, float, bool)):
-                clauses.append({"term": {f"metadata.{key}": value}})
+            field = f"metadata.{key}"
+            if isinstance(value, bool):
+                clauses.append({"term": {field: value}})
+            elif isinstance(value, int):
+                clauses.append({"term": {field: value}})
+            elif isinstance(value, float):
+                clauses.append({"term": {field: value}})
+            elif isinstance(value, str):
+                # 动态映射的字符串多为 text + .keyword；term 需走 keyword 子字段才与 PG jsonb 精确过滤接近
+                clauses.append({"term": {f"{field}.keyword": value}})
             else:
-                clauses.append({"match": {f"metadata.{key}": json.dumps(value, sort_keys=True)}})
+                clauses.append({"match": {field: json.dumps(value, sort_keys=True)}})
     return clauses
 
 
@@ -126,7 +139,18 @@ def search_bm25_lexical(
         },
         "size": limit,
     }
-    resp = client.search(index=index_name, query=body["query"], size=limit)
+    try:
+        resp = client.search(index=index_name, query=body["query"], size=limit)
+    except Exception as exc:
+        logger.error(
+            "BM25 search failed index=%s namespace=%s subject_id=%s: %s",
+            index_name,
+            namespace,
+            subject_id,
+            exc,
+            exc_info=True,
+        )
+        raise
     out: List[Dict[str, Any]] = []
     for hit in resp.get("hits", {}).get("hits", []):
         src = hit.get("_source") or {}
@@ -152,5 +176,6 @@ def cluster_health_snippet(client: Elasticsearch) -> str:
     try:
         h = client.cluster.health(request_timeout=5)
         return str(h.get("status", "unknown"))
-    except Exception:
+    except Exception as exc:
+        logger.warning("Elasticsearch cluster.health failed: %s", exc)
         return "unhealthy"

@@ -1,8 +1,12 @@
+import logging
+
 from fastapi import APIRouter, HTTPException, status
 
 from app.core.config import settings
 from app.models.schemas import ServiceTokenRequest, ServiceTokenResponse
 from app.services.auth_service import auth_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -16,6 +20,10 @@ async def issue_token(request: ServiceTokenRequest):
     )
 
     if service_client is None:
+        logger.warning(
+            "Token request rejected: invalid credentials for client_id=%s",
+            request.client_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid client credentials",

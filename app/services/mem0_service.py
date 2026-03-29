@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -7,6 +8,8 @@ from mem0 import Memory
 from app.core.config import settings
 from app.database.es_memory import make_elasticsearch_client, search_bm25_lexical
 from app.services.user_service import user_service
+
+logger = logging.getLogger(__name__)
 
 
 class Mem0Service:
@@ -55,6 +58,11 @@ class Mem0Service:
             client = Memory.from_config(self._get_global_config())
             client.enable_graph = False
             self._memory_client = client
+            logger.info(
+                "Mem0 Memory client initialized (index=%s, vector_dims=%s)",
+                settings.ELASTICSEARCH_INDEX,
+                settings.VECTOR_SIZE,
+            )
         return self._memory_client
 
     async def _get_subject_context(self, namespace: str, subject_id: str) -> Dict[str, Any]:
@@ -321,7 +329,21 @@ class Mem0Service:
         normalized_results = self._normalize_results(result)
         await self._track_successful_write(namespace, subject_id, len(normalized_results))
         if normalized_results:
-            return normalized_results[0]
+            first = normalized_results[0]
+            logger.info(
+                "add_memory namespace=%s subject_id=%s memory_id=%s infer=%s",
+                namespace,
+                subject_id,
+                first.get("id"),
+                infer,
+            )
+            return first
+        logger.info(
+            "add_memory namespace=%s subject_id=%s produced no mem0 rows infer=%s",
+            namespace,
+            subject_id,
+            infer,
+        )
         return {
             "text": content,
             "metadata": metadata or {},
@@ -368,6 +390,14 @@ class Mem0Service:
                 vf = float(vs) if vs is not None else None
                 row = {**it, "vector_score": vf, "lexical_score": None, "match_sources": ["vector"]}
                 out.append(self._finalize_search_item(row))
+            logger.info(
+                "search_memories mode=vector namespace=%s subject_id=%s query_len=%s limit=%s results=%s",
+                namespace,
+                subject_id,
+                len(query.strip()),
+                limit,
+                len(out),
+            )
             return {"items": out}
 
         if mode == "bm25":
@@ -392,6 +422,14 @@ class Mem0Service:
                     "match_sources": ["bm25"],
                 }
                 out_lex.append(self._finalize_search_item(row))
+            logger.info(
+                "search_memories mode=bm25 namespace=%s subject_id=%s query_len=%s limit=%s results=%s",
+                namespace,
+                subject_id,
+                len(query.strip()),
+                limit,
+                len(out_lex),
+            )
             return {"items": out_lex}
 
         vw, lw = self._normalized_hybrid_weights()
@@ -409,11 +447,30 @@ class Mem0Service:
 
         await user_service.touch_subject(namespace, subject_id)
         if not items_vec and not bm25_items:
+            logger.info(
+                "search_memories mode=hybrid namespace=%s subject_id=%s query_len=%s limit=%s no vector or bm25 hits",
+                namespace,
+                subject_id,
+                len(query.strip()),
+                limit,
+            )
             return {"items": []}
         merged = self._merge_hybrid_results(items_vec, bm25_items, vw, lw, limit)
         if min_hybrid_score is not None:
             merged = [x for x in merged if (x.get("_hybrid_fusion") or 0) >= min_hybrid_score]
-        return {"items": [self._finalize_search_item(m) for m in merged]}
+        finalized = [self._finalize_search_item(m) for m in merged]
+        logger.info(
+            "search_memories mode=hybrid namespace=%s subject_id=%s query_len=%s limit=%s "
+            "vector_hits=%s bm25_hits=%s merged=%s",
+            namespace,
+            subject_id,
+            len(query.strip()),
+            limit,
+            len(items_vec),
+            len(bm25_items),
+            len(finalized),
+        )
+        return {"items": finalized}
 
     async def search_memories(
         self,
@@ -453,7 +510,15 @@ class Mem0Service:
             run_id=run_id,
             limit=limit or 100,
         )
-        return {"items": self._normalize_results(results)}
+        items = self._normalize_results(results)
+        logger.info(
+            "get_all_memories namespace=%s subject_id=%s limit=%s returned=%s",
+            namespace,
+            subject_id,
+            limit or 100,
+            len(items),
+        )
+        return {"items": items}
 
     async def get_all_memories(
         self,
@@ -486,6 +551,12 @@ class Mem0Service:
             data=content,
         )
         await user_service.touch_subject(namespace, subject_id)
+        logger.info(
+            "update_memory namespace=%s subject_id=%s memory_id=%s",
+            namespace,
+            subject_id,
+            memory_id,
+        )
         return {
             "id": memory_id,
             "text": content,
@@ -503,6 +574,12 @@ class Mem0Service:
         memory_client = self._get_memory_client()
         await asyncio.to_thread(memory_client.delete, memory_id=memory_id)
         await user_service.touch_subject(namespace, subject_id)
+        logger.info(
+            "delete_memory namespace=%s subject_id=%s memory_id=%s",
+            namespace,
+            subject_id,
+            memory_id,
+        )
         return True
 
     async def add_memories_batch(
@@ -530,7 +607,13 @@ class Mem0Service:
                     infer=infer,
                 )
             except Exception as exc:
-                print(f"Failed to add memory: {exc}")
+                logger.warning(
+                    "add_memories_batch item failed namespace=%s subject_id=%s: %s",
+                    namespace,
+                    subject_id,
+                    exc,
+                    exc_info=True,
+                )
                 return None
 
         tasks = [_add_single(item) for item in memories]
@@ -538,6 +621,14 @@ class Mem0Service:
         results = [r for r in results_raw if r is not None]
         failed = len(memories) - len(results)
 
+        logger.info(
+            "add_memories_batch namespace=%s subject_id=%s total=%s added=%s failed=%s",
+            namespace,
+            subject_id,
+            len(memories),
+            len(results),
+            failed,
+        )
         return {
             "added_count": len(results),
             "failed_count": failed,
@@ -567,6 +658,14 @@ class Mem0Service:
         )
         normalized_results = self._normalize_results(result)
         await self._track_successful_write(namespace, subject_id, len(normalized_results))
+        logger.info(
+            "add_conversation_memory namespace=%s subject_id=%s messages=%s memories_extracted=%s infer=%s",
+            namespace,
+            subject_id,
+            len(messages),
+            len(normalized_results),
+            infer,
+        )
         return {
             "items": normalized_results,
             "count": len(normalized_results),
@@ -588,6 +687,7 @@ class Mem0Service:
             preferences=context.get("preferences"),
             custom_data=context.get("custom_data"),
         )
+        logger.info("set_subject_context namespace=%s subject_id=%s", namespace, subject_id)
         return result
 
     async def get_subject_context(self, namespace: str, subject_id: str) -> Dict[str, Any]:

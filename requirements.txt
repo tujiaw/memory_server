@@ -4,20 +4,17 @@ uvicorn[standard]==0.32.0
 pydantic==2.9.2
 pydantic-settings==2.6.0
 
-# Qdrant (mem0 主依赖，未使用向量后端时仍安装)
-qdrant-client==1.12.1
-
-# Mem0 - Memory management
+# Mem0（会拉取 qdrant-client 等传递依赖；向量后端使用 Elasticsearch）
 mem0ai==1.0.5
 
-# Elasticsearch（mem0 向量 + 本服务 BM25 检索）
+# Elasticsearch（mem0 向量 + 本服务 BM25）
 elasticsearch>=8.12.0,<9.0.0
 
 # OpenAI SDK
 openai==2.26.0
 httpx[socks]>=0.27.0,<0.28.0
 
-# PostgreSQL (ParadeDB-compatible)
+# PostgreSQL
 asyncpg>=0.29.0
 
 # Authentication & Security
@@ -28,7 +25,6 @@ python-multipart==0.0.12
 
 # Utilities
 python-dotenv==1.0.1
-orjson==3.11.7
 
 # Testing
 pytest==9.0.2

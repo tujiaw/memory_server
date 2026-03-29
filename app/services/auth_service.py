@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
+import logging
 import secrets
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,8 @@ from app.database.sql import (
     SERVICE_TOKEN_SELECT,
 )
 from app.models.schemas import AuthContext
+
+logger = logging.getLogger(__name__)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -89,6 +92,7 @@ class AuthService:
             "updated_at": now,
             "is_active": True,
         }
+        logger.info("Created service client client_id=%s namespaces=%s", client_id, namespaces)
         return {
             **self._serialize_service_client(document),
             "client_secret": client_secret,
@@ -136,6 +140,7 @@ class AuthService:
         updated = await pg_database.postgres_db.fetchrow(SERVICE_CLIENT_SELECT, client_id)
         if updated is None:
             return None
+        logger.info("Updated service client client_id=%s", client_id)
         return self._serialize_service_client(
             {
                 "client_id": updated["client_id"],
@@ -162,13 +167,17 @@ class AuthService:
             now,
             client_id,
         )
+        logger.info("Reset secret for service client client_id=%s", client_id)
         return {"client_id": client_id, "client_secret": new_secret}
 
     async def delete_service_client(self, client_id: str) -> bool:
         if pg_database.postgres_db.pool is None:
             return False
         status = await pg_database.postgres_db.execute(SERVICE_CLIENT_DELETE, client_id)
-        return status == "DELETE 1"
+        deleted = status == "DELETE 1"
+        if deleted:
+            logger.info("Deleted service client client_id=%s", client_id)
+        return deleted
 
     def _validate_settings_service_client(
         self,
@@ -245,6 +254,12 @@ class AuthService:
             namespaces=namespaces,
             expires_at=expires_at,
         )
+        logger.info(
+            "Issued service token service_id=%s namespaces=%s expires_at=%s",
+            service_id,
+            namespaces,
+            expires_at.isoformat(),
+        )
         return token
 
     def create_access_token(self, data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -284,7 +299,8 @@ class AuthService:
                 service_id=service_id,
                 namespaces=[str(namespace) for namespace in namespaces],
             )
-        except JWTError:
+        except JWTError as exc:
+            logger.debug("JWT verify failed: %s", exc)
             return None
 
     def hash_password(self, password: str) -> str:

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from typing import Any, Awaitable, Callable, List, Optional, TypeVar
 
 import asyncpg
@@ -6,6 +7,8 @@ import asyncpg
 from app.core.config import settings
 
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 
 def _is_transient_pool_error(exc: BaseException) -> bool:
@@ -102,6 +105,11 @@ class PostgresDB:
             except Exception as exc:
                 if not _is_transient_pool_error(exc) or attempt == 3:
                     raise
+                logger.warning(
+                    "PostgreSQL query retry %s/4 (transient): %s",
+                    attempt + 1,
+                    exc,
+                )
                 await asyncio.sleep(0.06 * (2**attempt))
 
     async def connect(self) -> None:
@@ -117,6 +125,7 @@ class PostgresDB:
                     timeout=90,
                 )
                 await self.init_schema()
+                logger.info("PostgreSQL pool connected and schema ready")
                 return
             except Exception as exc:
                 if self.pool is not None:
@@ -125,13 +134,20 @@ class PostgresDB:
                     finally:
                         self.pool = None
                 if not _is_transient_connect_error(exc) or attempt == 14:
+                    logger.error("PostgreSQL connection failed after retries: %s", exc, exc_info=True)
                     raise
+                logger.warning(
+                    "PostgreSQL connect attempt %s/15 failed: %s; retrying",
+                    attempt + 1,
+                    exc,
+                )
                 await asyncio.sleep(min(0.5 * (1.55**attempt), 10.0))
 
     async def disconnect(self) -> None:
         if self.pool is not None:
             await self.pool.close()
             self.pool = None
+            logger.info("PostgreSQL pool closed")
 
     async def init_schema(self) -> None:
         if self.pool is None:
@@ -147,6 +163,11 @@ class PostgresDB:
             except Exception as exc:
                 if not _is_transient_pool_error(exc) or attempt == 3:
                     raise
+                logger.warning(
+                    "PostgreSQL init_schema retry %s/4: %s",
+                    attempt + 1,
+                    exc,
+                )
                 await asyncio.sleep(0.06 * (2**attempt))
 
     async def execute(self, query: str, *args: Any) -> str:
