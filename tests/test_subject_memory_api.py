@@ -120,7 +120,7 @@ def test_search_memories_route_returns_items(monkeypatch):
     assert response.status_code == 200
     data = response.json()
     assert data["count"] == 1
-    assert captured["fusion"] == "hybrid"
+    assert captured["mode"] == "hybrid"
     assert "vector_min_score" not in captured
 
 
@@ -315,7 +315,7 @@ async def test_mem0_service_search_passes_filters(monkeypatch):
         subject_id="subject-1",
         query="python",
         limit=3,
-        fusion="vector",
+        mode="vector",
         run_id="session-1",
         filters={"category": "preference"},
     )

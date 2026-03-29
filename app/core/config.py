@@ -65,8 +65,8 @@ class Settings(BaseSettings):
     MEM0_HYBRID_VECTOR_WEIGHT: float = 0.7
     MEM0_HYBRID_BM25_WEIGHT: float = 0.3
     MEM0_SEARCH_VECTOR_MIN_SCORE: float = 0.0
-    MEM0_SEARCH_LEXICAL_MIN_SCORE: Optional[float] = None
-    MEM0_SEARCH_MIN_FUSION_SCORE: Optional[float] = None
+    MEM0_SEARCH_BM25_MIN_SCORE: Optional[float] = None
+    MEM0_SEARCH_MIN_HYBRID_SCORE: Optional[float] = None
 
     # Security
     SECRET_KEY: str

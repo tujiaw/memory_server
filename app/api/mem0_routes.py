@@ -58,7 +58,7 @@ async def search_memories(
             subject_id=request.subject_id,
             query=request.query,
             limit=request.limit,
-            fusion=request.fusion,
+            mode=request.mode,
             run_id=request.run_id,
             filters=request.filters,
         )

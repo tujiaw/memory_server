@@ -425,15 +425,15 @@ class Mem0Service:
         subject_id: str,
         query: str,
         limit: int = 10,
-        fusion: str = "hybrid",
+        mode: str = "hybrid",
         run_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         memory_client = self._get_memory_client()
         run_id = self._effective_run_id(run_id)
         vector_min_score = settings.MEM0_SEARCH_VECTOR_MIN_SCORE
-        lexical_min_score = settings.MEM0_SEARCH_LEXICAL_MIN_SCORE
-        min_fusion_score = settings.MEM0_SEARCH_MIN_FUSION_SCORE
+        bm25_min_score = settings.MEM0_SEARCH_BM25_MIN_SCORE
+        min_hybrid_score = settings.MEM0_SEARCH_MIN_HYBRID_SCORE
 
         async def _vector_hits(search_limit: int, threshold: float) -> List[Dict[str, Any]]:
             payload = await asyncio.to_thread(
@@ -448,7 +448,7 @@ class Mem0Service:
             )
             return self._normalize_results(payload)
 
-        if fusion == "vector":
+        if mode == "vector":
             items_raw = await _vector_hits(limit, vector_min_score)
             await user_service.touch_subject(namespace, subject_id)
             out: List[Dict[str, Any]] = []
@@ -459,7 +459,7 @@ class Mem0Service:
                 out.append(self._finalize_search_item(row))
             return {"items": out}
 
-        if fusion == "lexical":
+        if mode == "bm25":
             await user_service.touch_subject(namespace, subject_id)
             bm25_items = await self._search_bm25_in_db(
                 namespace=namespace,
@@ -469,8 +469,8 @@ class Mem0Service:
                 filters=filters,
                 limit=limit,
             )
-            if lexical_min_score is not None:
-                bm25_items = [x for x in bm25_items if (x.get("score") or 0) >= lexical_min_score]
+            if bm25_min_score is not None:
+                bm25_items = [x for x in bm25_items if (x.get("score") or 0) >= bm25_min_score]
             out_lex: List[Dict[str, Any]] = []
             for it in bm25_items:
                 raw = float(it.get("score") or 0)
@@ -493,15 +493,15 @@ class Mem0Service:
             filters=filters,
             limit=limit,
         )
-        if lexical_min_score is not None:
-            bm25_items = [x for x in bm25_items if (x.get("score") or 0) >= lexical_min_score]
+        if bm25_min_score is not None:
+            bm25_items = [x for x in bm25_items if (x.get("score") or 0) >= bm25_min_score]
 
         await user_service.touch_subject(namespace, subject_id)
         if not items_vec and not bm25_items:
             return {"items": []}
         merged = self._merge_hybrid_results(items_vec, bm25_items, vw, lw, limit)
-        if min_fusion_score is not None:
-            merged = [x for x in merged if (x.get("_hybrid_fusion") or 0) >= min_fusion_score]
+        if min_hybrid_score is not None:
+            merged = [x for x in merged if (x.get("_hybrid_fusion") or 0) >= min_hybrid_score]
         return {"items": [self._finalize_search_item(m) for m in merged]}
 
     async def search_memories(
@@ -510,7 +510,7 @@ class Mem0Service:
         subject_id: str,
         query: str,
         limit: int = 10,
-        fusion: str = "hybrid",
+        mode: str = "hybrid",
         run_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
@@ -520,7 +520,7 @@ class Mem0Service:
             subject_id=subject_id,
             query=query,
             limit=limit,
-            fusion=fusion,
+            mode=mode,
             run_id=run_id,
             filters=filters,
         )
